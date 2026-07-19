@@ -10,6 +10,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 RUN mkdir -p /models/piper
+COPY payers/ ./payers/
 
 # Dev: source is volume-mounted — hot reload via uvicorn --reload
 

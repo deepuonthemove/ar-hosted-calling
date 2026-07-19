@@ -1,8 +1,12 @@
-"""CallSession — per-call voice pipeline over Twilio Media Streams.
+"""CallSession — per-call voice pipeline with state machine and knowledge base.
 
-Port of the Cloudflare Durable Object (src/do.ts):
-  Twilio WS ↔ VAD → Faster-Whisper → vLLM (markers) → Piper TTS → Twilio
-  with DTMF, hold detection, barge-in, silence watchdog, result persistence.
+Port of src/do.ts with extensions:
+  - JSON [CALL_RESULT] instead of positional [END:...]
+  - State machine (GREETING → ... → CLOSE)
+  - Layered prompts (base + claim context + payer IVR map + denial codes)
+  - IVR drift detection (verify phrase matching)
+  - Hold polling (30s interval, configurable timeout)
+  - Human handoff triggers
 """
 import asyncio
 import base64
@@ -15,13 +19,21 @@ import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 
 from audio import VAD, twilio_to_whisper, piper_to_twilio, rms
-from prompts import build_system_prompt, build_greeting, parse_markers
+from prompts import (
+    build_call_prompt, build_greeting, parse_markers,
+    parse_call_result, load_payer, load_denial_codes,
+)
 
 log = logging.getLogger("call-session")
 
-MAX_SILENCE_MS = 19 * 60 * 1000   # ported: 19-minute hard cap
-HOLD_NUDGE_MS = 4000              # inject [Hold music detected] after 4s silence
+MAX_SILENCE_MS = 19 * 60 * 1000
+HOLD_NUDGE_MS = 10000
+HOLD_POLL_MS = 5000
+MAX_HOLD_SEC = int(os.getenv("MAX_HOLD_SEC", "1800"))
 PIPER_RATE = int(os.getenv("PIPER_SAMPLE_RATE", "22050"))
+
+STATES = ["GREETING", "IVR_NAV", "CLAIM_VERIFY", "STATUS_GATHER",
+          "DENIAL_HANDLE", "APPROVED_HANDLE", "CLOSE"]
 
 
 class CallSession:
@@ -38,12 +50,20 @@ class CallSession:
         self.stream_sid: str | None = None
         self.account_uid = ""
         self.account: dict | None = None
-        self.conversation: list[dict] = []
+        self.state = "GREETING"
+        self.payer_data: dict | None = None
+        self.last_verify_phrase: str | None = None
+        self.drift_logged = False
+        self.hold_start: float | None = None
+        self.call_result_retries = 0
+
         self.vad = VAD()
         self.is_bot_speaking = False
         self.is_call_ended = False
         self.last_activity = time.time()
         self.last_hold_nudge = 0.0
+        self.conversation: list[dict] = []
+        self.system_prompt = build_call_prompt("GREETING", None, None, None)
         self.tts_task: asyncio.Task | None = None
         self.watchdog_task: asyncio.Task | None = None
 
@@ -52,16 +72,27 @@ class CallSession:
         await self.ws.accept()
         log.info("[%s] Media stream connected", self.call_sid)
 
-        # Load call + account context from Redis (same keys as Cloudflare)
         call_data = await self.redis.hgetall(f"call:{self.call_sid}")
         self.account_uid = call_data.get("account_uid", "")
         if self.account_uid:
             self.account = await self.redis.hgetall(f"account:{self.account_uid}") or None
 
-        # Mistral doesn't support system role — store separately, prepend to first user message
-        self.system_prompt = build_system_prompt(self.account)
-        self.conversation: list[dict] = []
-        self.has_system = False
+        payer_name = (
+            self.account.get("Responsible Payer") if self.account
+            else call_data.get("payer")
+        )
+        if payer_name:
+            self.payer_data = load_payer(payer_name)
+            codes = load_denial_codes()
+
+        denial_subset = None
+        if self.payer_data:
+            denial_subset = self.payer_data.get("common_denials")
+
+        self.system_prompt = build_call_prompt(
+            "GREETING", self.payer_data, denial_subset, self.account
+        )
+        self.conversation = [{"role": "system", "content": self.system_prompt}]
         self.watchdog_task = asyncio.create_task(self._silence_watchdog())
 
         try:
@@ -76,7 +107,6 @@ class CallSession:
                     await self._finalize("disconnected")
                     break
         except WebSocketDisconnect:
-            log.info("[%s] Twilio WS disconnected", self.call_sid)
             await self._finalize("disconnected")
         except Exception as e:
             log.error("[%s] Session error: %s", self.call_sid, e)
@@ -94,14 +124,21 @@ class CallSession:
             self.account_uid = params.get("account_uid", "")
             if self.account_uid:
                 self.account = await self.redis.hgetall(f"account:{self.account_uid}") or None
-                self.system_prompt = build_system_prompt(self.account)
+                payer_name = self.account.get("Responsible Payer") if self.account else None
+                if payer_name:
+                    self.payer_data = load_payer(payer_name)
+                denial_subset = self.payer_data.get("common_denials") if self.payer_data else None
+                self.system_prompt = build_call_prompt(
+                    "GREETING", self.payer_data, denial_subset, self.account
+                )
 
-        log.info("[%s] Stream started: %s", self.call_sid, self.stream_sid)
+        log.info("[%s] Stream started: %s | state=%s", self.call_sid, self.stream_sid, self.state)
         await self.redis.hset(f"call:{self.call_sid}", mapping={"status": "in-progress"})
 
-        # Speak greeting (patient context injected), don't add to conversation
         greeting = build_greeting(self.account)
+        self.conversation.append({"role": "assistant", "content": greeting})
         await self._speak(greeting)
+        self.state = "IVR_NAV"
 
     async def _on_media(self, data: dict):
         payload = base64.b64decode(data["media"]["payload"])
@@ -109,11 +146,12 @@ class CallSession:
         now = time.time()
         self.last_activity = now
 
+        # Barge-in: user spoke while bot is talking
+        if self.is_bot_speaking and rms(audio) > 0.02:
+            await self._barge_in()
+
         segment = self.vad.add(audio, now)
         if segment is None:
-            # Barge-in: user started speaking while bot talks
-            if self.is_bot_speaking and rms(audio) > 0.02:
-                await self._barge_in()
             return
 
         await self._cancel_tts()
@@ -136,34 +174,30 @@ class CallSession:
             )
             return " ".join(s.text for s in segments).strip()
 
-    # ── LLM with markers (ported from runLLM) ────────────────────────────
+    # ── LLM with state machine ───────────────────────────────────────────
     async def _run_llm(self, user_text: str):
         if self.is_call_ended:
             return
 
-        # End-of-call detection — check if user wants to hang up
         if self._detect_call_end(user_text):
-            log.info("[%s] Detected end of call from user", self.call_sid)
-            result = {
-                "payer": (self.account or {}).get("Responsible Payer", "unknown"),
-                "claim_id": (self.account or {}).get("Account Number", "unknown"),
-                "status": "completed",
-                "next_action": "Call completed by user",
-            }
+            log.info("[%s] End-of-call detected from user", self.call_sid)
             await self._speak("Thank you. Have a great day!")
             await asyncio.sleep(1.5)
-            await self._finalize("completed", result=result)
+            await self._finalize("completed")
             return
 
-        # Mistran doesn't support system role — prepend to first user message
-        msg = f"{self.system_prompt}\n\n{user_text}" if not self.conversation else user_text
-        self.conversation.append({"role": "user", "content": msg})
+        # IVR drift: check if the expected verify phrase was in this transcript
+        await self._check_verify_on_transcript(user_text)
+
+        # Qwen supports system role natively. Prepend state info to user message.
+        state_tag = f"[STATE: {self.state}]"
+        self.conversation.append({"role": "user", "content": f"{state_tag} {user_text}"})
 
         try:
             stream = await self.llm_client.chat.completions.create(
                 model=self.llm_model,
                 messages=self.conversation,
-                max_tokens=150,
+                max_tokens=200,
                 temperature=0,
                 stream=True,
             )
@@ -173,63 +207,122 @@ class CallSession:
                 token = chunk.choices[0].delta.content or ""
                 bot_text += token
                 sentence_buffer += token
-                # Stream TTS at sentence boundaries for low latency
                 if token in (".", "!", "?", "\n") and len(sentence_buffer.strip()) > 2:
                     parsed = parse_markers(sentence_buffer)
                     if parsed["spoken"]:
                         await self._speak(parsed["spoken"])
                     sentence_buffer = ""
 
-            # Handle any trailing tokens
             if sentence_buffer.strip():
                 parsed_tail = parse_markers(sentence_buffer)
                 if parsed_tail["spoken"]:
                     await self._speak(parsed_tail["spoken"])
 
-            log.info("[%s] LLM: %s", self.call_sid, bot_text)
+            log.info("[%s] LLM (state=%s): %s", self.call_sid, self.state, bot_text)
             self.conversation.append({"role": "assistant", "content": bot_text})
             await self.redis.hset(f"call:{self.call_sid}", mapping={"last_llm_response": bot_text})
 
             parsed = parse_markers(bot_text)
 
+            # ── DTMF handling + IVR drift detection ─────────────────────
             if parsed["dtmf"]:
                 log.info("[%s] DTMF: %s", self.call_sid, parsed["dtmf"])
                 await self._send_dtmf(parsed["dtmf"])
+                # IVR drift: detect if the verify phrase is missing
+                if self.payer_data and not self.drift_logged:
+                    await self._check_ivr_drift(parsed["dtmf"])
 
+            # ── Waiting on hold ──────────────────────────────────────────
             if parsed["waiting"]:
                 log.info("[%s] Waiting on hold", self.call_sid)
+                if self.hold_start is None:
+                    self.hold_start = time.time()
 
-            if parsed["end"]:
-                await self._finalize("completed", result=parsed["end"])
+            # ── End call with [CALL_RESULT] JSON ─────────────────────────
+            call_result = parse_call_result(bot_text)
+            if call_result:
+                await self._finalize("completed", result=call_result)
+                return
+
+            # ── State machine transition ─────────────────────────────────
+            self._advance_state(bot_text)
 
         except Exception as e:
             log.error("[%s] LLM error: %s", self.call_sid, e)
             await self.redis.hset(f"call:{self.call_sid}", mapping={"last_error": f"LLM: {e}"})
 
-    # ── End-of-call detection ──────────────────────────────────────────
-    _END_PHRASES = [
-        "bye", "goodbye", "see you", "that's all", "i'm done", "cut the call",
-        "end the call", "hang up", "that is all", "no more", "i'm finished",
-        "all done", "thank you goodbye",
-    ]
+    # ── State Machine ────────────────────────────────────────────────────
+    def _advance_state(self, bot_text: str):
+        lower = bot_text.lower()
+        if self.state == "IVR_NAV" and ("connected" in lower or "agent" in lower or "representative" in lower):
+            self.state = "CLAIM_VERIFY"
+            log.info("[%s] state: IVR_NAV → CLAIM_VERIFY", self.call_sid)
+        elif self.state == "CLAIM_VERIFY" and any(w in lower for w in ["paid", "denied", "pending", "status"]):
+            if "denied" in lower or "denial" in lower:
+                self.state = "DENIAL_HANDLE"
+            elif "paid" in lower or "approved" in lower:
+                self.state = "APPROVED_HANDLE"
+            else:
+                self.state = "STATUS_GATHER"
+            log.info("[%s] state: → %s", self.call_sid, self.state)
+        elif self.state == "STATUS_GATHER" and any(w in lower for w in ["denied", "denial"]):
+            self.state = "DENIAL_HANDLE"
+            log.info("[%s] state: → DENIAL_HANDLE", self.call_sid)
+        elif self.state == "STATUS_GATHER" and any(w in lower for w in ["paid", "approved"]):
+            self.state = "APPROVED_HANDLE"
+            log.info("[%s] state: → APPROVED_HANDLE", self.call_sid)
 
-    def _detect_call_end(self, text: str) -> bool:
-        if len(self.conversation) < 2:
-            return False
-        lower = text.lower().strip()
-        if any(phrase in lower for phrase in self._END_PHRASES):
-            return True
-        # Assistant already said goodbye + user acknowledges
-        if self.conversation and any(
-            "have a great day" in (m.get("content", "")).lower()
-            or "goodbye" in (m.get("content", "")).lower()
-            for m in self.conversation[-3:]
-        ):
-            if lower in ("okay", "ok", "thanks", "thank you", "bye", "sure", "yes"):
-                return True
-        return False
+    # ── IVR Drift Detection ─────────────────────────────────────────────
+    async def _check_ivr_drift(self, dtmf_digit: str):
+        """After sending DTMF, if the system expected a verify_phrase
+        but the next transcription doesn't match, log an anomaly."""
+        if not self.payer_data:
+            return
+        ivr = self.payer_data.get("ivr_tree", {})
+        expected_phrase = None
+        for key, nodes in ivr.items():
+            for n in nodes:
+                if n.get("dtmf") == dtmf_digit:
+                    expected_phrase = n.get("verify_phrase", "")
+                    break
 
-    # ── TTS → Twilio μ-law ───────────────────────────────────────────────
+        if not expected_phrase:
+            return
+
+        # Listen for the next transcription (non-blocking: check next user input)
+        # We store the expected phrase; on the next _run_llm call, check the transcript
+        self.last_verify_phrase = expected_phrase
+
+    async def _check_verify_on_transcript(self, text: str):
+        """Called from _run_llm after hearing the next utterance."""
+        if not self.last_verify_phrase or self.drift_logged:
+            return
+        if self.last_verify_phrase.lower() not in text.lower():
+            log.warning("[%s] IVR DRIFT: expected '%s' but heard '%s'",
+                        self.call_sid, self.last_verify_phrase, text)
+            self.drift_logged = True
+            await self.redis.hset(f"call:{self.call_sid}", mapping={
+                "ivr_drift": json.dumps({
+                    "expected": self.last_verify_phrase,
+                    "heard": text,
+                    "payer": (
+                        self.account.get("Responsible Payer", "unknown")
+                        if self.account else "unknown"
+                    ),
+                })
+            })
+            # Log anomaly to the payer drift set
+            payer_name = self.account.get("Responsible Payer", "unknown") if self.account else "unknown"
+            anomaly = json.dumps({
+                "ts": time.time(),
+                "call_sid": self.call_sid,
+                "expected": self.last_verify_phrase,
+                "heard": text,
+            })
+            await self.redis.zadd(f"ivr_drift:{payer_name}", {anomaly: time.time()})
+        self.last_verify_phrase = None
+
+    # ── TTS → Twilio ────────────────────────────────────────────────────
     async def _speak(self, text: str):
         if self.is_call_ended or not self.stream_sid:
             return
@@ -244,7 +337,6 @@ class CallSession:
                     np.frombuffer(pcm_chunk, dtype=np.int16), PIPER_RATE
                 )
                 frame.extend(mulaw)
-                # Twilio expects ~20ms frames = 160 bytes at 8kHz μ-law
                 while len(frame) >= 160:
                     chunk = bytes(frame[:160])
                     del frame[:160]
@@ -263,7 +355,7 @@ class CallSession:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            log.warning("[%s] TTS stream error: %s", self.call_sid, e)
+            log.warning("[%s] TTS error: %s", self.call_sid, e)
             self.is_bot_speaking = False
 
     async def _cancel_tts(self):
@@ -277,7 +369,6 @@ class CallSession:
         self.is_bot_speaking = False
 
     async def _barge_in(self):
-        """Ported: clear Twilio buffer + cancel TTS when caller speaks."""
         await self._cancel_tts()
         if self.stream_sid:
             try:
@@ -288,7 +379,6 @@ class CallSession:
                 pass
 
     async def _send_dtmf(self, digit: str):
-        """Ported: Twilio Media Streams DTMF message."""
         try:
             await self.ws.send_text(json.dumps({
                 "event": "dtmf",
@@ -298,34 +388,79 @@ class CallSession:
         except Exception as e:
             log.error("[%s] DTMF send failed: %s", self.call_sid, e)
 
-    # ── Hold music + silence watchdog (ported) ───────────────────────────
+    # ── Hold + Silence Watchdog ─────────────────────────────────────────
     async def _silence_watchdog(self):
         try:
             while not self.is_call_ended:
-                await asyncio.sleep(0.5)
                 silence_ms = (time.time() - self.last_activity) * 1000
+                is_holding = self.hold_start is not None
 
-                # Hold music nudge (ported: VAD events → [Hold music detected])
-                if (silence_ms > HOLD_NUDGE_MS
-                        and time.time() - self.last_hold_nudge > 10
-                        and not self.is_bot_speaking):
-                    self.last_hold_nudge = time.time()
-                    await self._run_llm("[Hold music detected]")
-
-                # 19-minute hard cap (ported from do.ts silenceTimer)
-                if silence_ms > MAX_SILENCE_MS:
-                    log.warning("[%s] Max silence reached", self.call_sid)
-                    await self._finalize("failed", error="Max silence reached")
-                    break
+                if is_holding:
+                    await asyncio.sleep(30)
+                    if (time.time() - self.hold_start) > MAX_HOLD_SEC:
+                        log.warning("[%s] Hold timeout exceeded", self.call_sid)
+                        await self._speak("I've been unable to reach a representative. I'll call back later.")
+                        await asyncio.sleep(2)
+                        await self._finalize("hold_timeout")
+                        break
+                else:
+                    await asyncio.sleep(0.5)
+                    if (silence_ms > HOLD_NUDGE_MS
+                            and time.time() - self.last_hold_nudge > 10
+                            and not self.is_bot_speaking):
+                        self.last_hold_nudge = time.time()
+                        await self._run_llm("[Hold music detected]")
+                    if silence_ms > MAX_SILENCE_MS:
+                        log.warning("[%s] Max silence", self.call_sid)
+                        await self._finalize("failed", error="Max silence")
+                        break
         except asyncio.CancelledError:
             pass
 
-    # ── Finalization (ported from closeCall + finalizeCall) ──────────────
+    # ── End-of-call detection ────────────────────────────────────────────
+    _END_PHRASES = [
+        "bye", "goodbye", "see you", "that's all", "i'm done", "cut the call",
+        "end the call", "hang up", "that is all", "no more", "i'm finished",
+        "all done", "thank you goodbye",
+    ]
+
+    def _detect_call_end(self, text: str) -> bool:
+        if len(self.conversation) < 2:
+            return False
+        lower = text.lower().strip()
+        if any(phrase in lower for phrase in self._END_PHRASES):
+            return True
+        if any(
+            "have a great day" in (m.get("content", "")).lower()
+            or "goodbye" in (m.get("content", "")).lower()
+            for m in self.conversation[-3:]
+        ):
+            if lower in ("okay", "ok", "thanks", "thank you", "bye", "sure", "yes"):
+                return True
+        return False
+
+    # ── Finalization ─────────────────────────────────────────────────────
     async def _finalize(self, status: str, result: dict | None = None, error: str = ""):
         if self.is_call_ended:
             return
         self.is_call_ended = True
         await self._cancel_tts()
+
+        # If a [CALL_RESULT] was provided, use it.
+        # Otherwise, if we have [CALL_RESULT] in the last LLM output, parse it.
+        if not result:
+            last_msg = self.conversation[-1]["content"] if self.conversation else ""
+            result = parse_call_result(last_msg)
+
+        # Retry with LLM repair if parsing failed
+        if not result and self.call_result_retries < 2:
+            self.call_result_retries += 1
+            last_msg = self.conversation[-1]["content"] if self.conversation else ""
+            try:
+                import prompts as pmod
+                result = pmod.attempt_repair(last_msg, self.llm_client, self.llm_model)
+            except Exception:
+                pass
 
         try:
             call_data = await self.redis.hgetall(f"call:{self.call_sid}")
@@ -338,12 +473,13 @@ class CallSession:
                 "duration_ms": str(duration_ms),
             }
             if result:
-                update.update({
-                    "payer": result.get("payer", "unknown"),
-                    "claim_id": result.get("claim_id", "unknown"),
-                    "amount": result.get("amount") or "",
-                    "next_action": result.get("next_action", "none"),
-                })
+                for key in ["payer", "claim_id", "next_action", "denial_code",
+                            "paid_amount", "billed_amount", "appeal_deadline",
+                            "call_summary", "satisfaction"]:
+                    if key in result:
+                        update[key] = str(result[key])
+                update["payer"] = result.get("payer", call_data.get("payer", "unknown"))
+                update["claim_id"] = result.get("claim_id", call_data.get("claim_id", "unknown"))
             if error:
                 update["last_error"] = error
 
@@ -352,15 +488,20 @@ class CallSession:
                 "callSid": self.call_sid, **update
             }))
 
-            # Update Excel account row (ported)
             if self.account_uid:
                 today = time.strftime("%m/%d/%Y")
                 if result:
                     account_update = {
-                        "Call Comments": result.get("next_action") or "Call completed",
+                        "Call Comments": result.get("call_summary", "Call completed"),
                         "Call Date": today,
                         "Call Status": "Calls Done",
                     }
+                    if result.get("denial_code"):
+                        account_update["Denial Code"] = result["denial_code"]
+                    if result.get("paid_amount"):
+                        account_update["Amount Paid"] = result["paid_amount"]
+                    if result.get("next_action"):
+                        account_update["Next Action"] = result["next_action"]
                 else:
                     account_update = {
                         "Call Comments": "Call disconnected" if status == "disconnected" else "Call failed",

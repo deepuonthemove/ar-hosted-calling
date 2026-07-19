@@ -16,6 +16,7 @@ RUN python -m piper --help > /dev/null 2>&1; \
       --data-dir /models/piper --output-raw > /dev/null 2>&1 || true
 
 COPY server.py call_session.py audio.py prompts.py ./
+COPY payers/ ./payers/
 
 EXPOSE 8080
 

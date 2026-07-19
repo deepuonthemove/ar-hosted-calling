@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "payer": "Aetna",
+  "phone": "18009552547",
+  "last_verified": "2026-07-01",
+  "ivr_tree": {
+    "main": [
+      {"prompt_phrase": "press 1 for claims", "dtmf": "1", "next": "claims", "verify_phrase": "claims"},
+      {"prompt_phrase": "press 2 for provider services", "dtmf": "2", "next": "provider", "verify_phrase": "provider"},
+      {"prompt_phrase": "press 3 for benefits", "dtmf": "3", "next": "benefits", "verify_phrase": "benefits"}
+    ],
+    "claims": [
+      {"prompt_phrase": "enter your 10 digit NPI", "dtmf_mode": "numpad", "next": "npi_verify", "verify_phrase": "NPI"},
+      {"prompt_phrase": "press 1 for claim status", "dtmf": "1", "next": "claim_status", "verify_phrase": "claim status"},
+      {"prompt_phrase": "press 2 for claim appeal", "dtmf": "2", "next": "appeal", "verify_phrase": "appeal"}
+    ],
+    "npi_verify": [
+      {"prompt_phrase": "press 1 if correct", "dtmf": "1", "next": "agent_menu", "verify_phrase": "correct"},
+      {"prompt_phrase": "press 2 to re-enter", "dtmf": "2", "next": "claims", "verify_phrase": "re-enter"}
+    ],
+    "agent_menu": [
+      {"prompt_phrase": "for claim status", "dtmf": "1", "next": "connected", "verify_phrase": "connected"},
+      {"prompt_phrase": "for payment inquiries", "dtmf": "2", "next": "connected", "verify_phrase": "connected"}
+    ]
+  },
+  "common_denials": ["CO-25", "CO-45", "CO-50", "CO-97", "CO-109", "CO-204", "PR-96", "OA-23"],
+  "appeal_info": "Submit appeal via Availity provider portal within 180 days of remittance advice",
+  "hold_behavior": "plays_music_with_periodic_voice_updates"
+}

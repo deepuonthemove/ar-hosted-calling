@@ -27,7 +27,7 @@ from openpyxl import load_workbook, Workbook
 
 from audio import VAD, twilio_to_whisper, piper_to_twilio, rms
 from call_session import CallSession
-from prompts import build_system_prompt
+from prompts import build_call_prompt, parse_markers, parse_call_result, build_greeting, load_payer, load_denial_codes, attempt_repair
 
 # ── Config ───────────────────────────────────────────────────────────────
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "distil-large-v3")
@@ -76,15 +76,23 @@ async def tts_stream(text: str):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
-    proc.stdin.write(text.encode())
-    await proc.stdin.drain()
-    proc.stdin.close()
-    while True:
-        chunk = await proc.stdout.read(4096)
-        if not chunk:
-            break
-        yield chunk
-    await proc.wait()
+    try:
+        proc.stdin.write(text.encode())
+        await proc.stdin.drain()
+        proc.stdin.close()
+        while True:
+            chunk = await proc.stdout.read(4096)
+            if not chunk:
+                break
+            yield chunk
+        await proc.wait()
+    finally:
+        if proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
 
 
 # ── End-of-call detection ────────────────────────────────────────────────
@@ -453,10 +461,32 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
     """Direct browser voice test (16kHz PCM) with barge-in."""
     await ws.accept()
     await ws.send_json({"type": "config", "sample_rate": PIPER_RATE})
+
+    # Parse account_uid from WebSocket URL query params
+    account_uid = ""
+    try:
+        qs = str(ws.url).split("?")[1] if "?" in str(ws.url) else ""
+        for part in qs.split("&"):
+            k, _, v = part.partition("=")
+            if k == "account_uid" and v:
+                account_uid = v
+    except Exception:
+        pass
+
+    account = None
+    if account_uid:
+        account = await state["redis"].hgetall(f"account:{account_uid}") or None
+
+    system_prompt = build_call_prompt("GREETING", None, None, account)
+    conversation: list[dict] = [{"role": "system", "content": system_prompt}]
+
+    # Speak greeting with claim context right away
+    greeting = build_greeting(account)
+    conversation.append({"role": "assistant", "content": greeting})
+    await ws.send_json({"type": "llm_text", "text": greeting})
+    tts_task = asyncio.create_task(_stream_tts_reply(ws, greeting))
+
     vad = VAD()
-    system_prompt = build_system_prompt(None)
-    conversation: list[dict] = []
-    tts_task: asyncio.Task | None = None
     barge_in = False
 
     async def cancel_tts():
@@ -508,7 +538,7 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                 await ws.close()
                 return
 
-            conversation.append({"role": "user", "content": text if conversation else f"{system_prompt}\n\n{text}"})
+            conversation.append({"role": "user", "content": text})
             await ws.send_json({"type": "transcript", "text": text})
             resp = await state["llm_client"].chat.completions.create(
                 model=LLM_MODEL, messages=conversation[-7:], max_tokens=150, temperature=0)
@@ -531,7 +561,6 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
 
 
 async def _stream_tts_reply(ws: WebSocket, text: str):
-    """Background task: stream TTS audio. Cancel on barge-in."""
     try:
         async for pcm_bytes in tts_stream(text):
             await ws.send_bytes(b"\x01" + pcm_bytes)
@@ -573,6 +602,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </form>
         <div id="msg" class="mt-3 text-xs hidden"></div>
       </div>
+
+      <!-- Browser Call Button -->
+      <button id="browser-call-btn" onclick="toggleBrowserCall()"
+        class="w-full bg-green-700 hover:bg-green-600 font-bold p-3 rounded text-sm transition duration-200">
+        🎤 Call from Browser
+      </button>
+
+      <!-- Browser Call Panel (hidden by default) -->
+      <div id="browser-call-panel" class="bg-gray-800 rounded-lg p-4 hidden">
+        <div class="flex justify-between items-center mb-3">
+          <h2 class="text-lg font-bold">🟢 Live Browser Call</h2>
+          <button onclick="endBrowserCall()"
+            class="px-3 py-1 bg-red-700 hover:bg-red-600 rounded text-xs font-bold">End Call</button>
+        </div>
+        <div id="browser-log" class="h-48 overflow-y-auto bg-gray-900 rounded p-3 text-xs font-mono space-y-1"></div>
+      </div>
+
       <div class="grid grid-cols-2 gap-4">
         <div class="bg-gray-800 p-4 rounded-lg"><div class="text-sm text-gray-400">Calls</div>
           <div id="calls-today" class="text-2xl font-bold">0</div></div>
@@ -696,6 +742,105 @@ $('call-form').onsubmit = async e => {
 fetchAccounts(); fetchCalls();
 setInterval(fetchCalls, 3000);
 setInterval(fetchAccounts, 5000);
+
+// ── Browser Call ──────────────────────────────────────────────────────
+let bcWS = null, bcMic = null, bcCtx = null, bcSrc = null, bcProc = null;
+let bcPlayCtx = null, bcAudioQ = [], bcPlaying = false, bcCurSrc = null;
+let bcLogEl = null;
+
+function bcLog(msg, cls) {
+  const d = document.createElement('div');
+  d.textContent = msg;
+  if (cls) d.className = cls;
+  if (bcLogEl) { bcLogEl.appendChild(d); bcLogEl.scrollTop = bcLogEl.scrollHeight; }
+}
+
+function toggleBrowserCall() {
+  if (bcWS && bcWS.readyState === WebSocket.OPEN) { endBrowserCall(); return; }
+  startBrowserCall();
+}
+
+function endBrowserCall() {
+  if (bcPlayCtx) { bcPlayCtx.close(); bcPlayCtx = null; }
+  if (bcProc) { bcProc.disconnect(); bcProc = null; }
+  if (bcSrc) { bcSrc.disconnect(); bcSrc = null; }
+  if (bcMic) { bcMic.getTracks().forEach(t => t.stop()); bcMic = null; }
+  if (bcCtx) { bcCtx.close(); bcCtx = null; }
+  if (bcWS) { bcWS.close(); bcWS = null; }
+  bcAudioQ = []; bcPlaying = false; bcCurSrc = null;
+  $('browser-call-panel').classList.add('hidden');
+  $('browser-call-btn').textContent = '🎤 Call from Browser';
+  $('browser-call-btn').className = 'w-full bg-green-700 hover:bg-green-600 font-bold p-3 rounded text-sm';
+}
+
+async function startBrowserCall() {
+  const sid = 'browser_' + Math.random().toString(36).slice(2);
+  const uid = ($('account_uid') && $('account_uid').value) || '';
+  bcPlayCtx = new AudioContext(); // create inside user gesture — ensures running state
+  bcWS = new WebSocket('wss://' + location.host + '/ws/' + sid + (uid ? '?account_uid=' + uid : ''));
+  bcWS.binaryType = 'arraybuffer';
+
+  $('browser-call-panel').classList.remove('hidden');
+  bcLogEl = $('browser-log');
+  bcLogEl.innerHTML = '<div class="text-green-400">Connecting...</div>';
+  $('browser-call-btn').textContent = '🔴 End Browser Call';
+  $('browser-call-btn').className = 'w-full bg-red-700 hover:bg-red-600 font-bold p-3 rounded text-sm';
+
+  bcWS.onopen = async () => {
+    bcLogEl.innerHTML = '<div class="text-green-400">Connected — starting mic...</div>';
+    try {
+      bcCtx = new AudioContext({ sampleRate: 16000 });
+      bcMic = await navigator.mediaDevices.getUserMedia({ audio: true });
+      bcSrc = bcCtx.createMediaStreamSource(bcMic);
+      bcProc = bcCtx.createScriptProcessor(4096, 1, 1);
+      bcProc.onaudioprocess = e => {
+        if (!bcWS || bcWS.readyState !== 1) return;
+        const inp = e.inputBuffer.getChannelData(0);
+        const b = new Int16Array(inp.length);
+        for (let i = 0; i < inp.length; i++) b[i] = Math.max(-32768, Math.min(32767, inp[i] * 32768));
+        bcWS.send(b.buffer);
+      };
+      bcSrc.connect(bcProc);
+      bcProc.connect(bcCtx.destination);
+      bcLogEl.innerHTML = '<div class="text-green-400">✅ Mic active — speak now</div>';
+    } catch (e) {
+      bcLogEl.innerHTML = '<div class="text-red-400">❌ Mic error: ' + e.message + '</div>';
+    }
+  };
+
+  bcWS.onmessage = e => {
+    if (typeof e.data === 'string') {
+      const m = JSON.parse(e.data);
+      if (m.type === 'config') { bcPlayCtx = new AudioContext(); return; }
+      bcLog(m.text, m.type === 'transcript' ? 'text-blue-300' : 'text-orange-300');
+    } else {
+      const v = new Uint8Array(e.data);
+      if (v[0] === 1) { bcAudioQ.push(v.slice(1)); if (!bcPlaying) bcPlayNext(); }
+      else if (v[0] === 2) { bcAudioQ = []; if (bcPlaying && bcCurSrc) { bcPlaying = false; try { bcCurSrc.stop(); } catch (e) {} } }
+    }
+  };
+
+  bcWS.onclose = () => {
+    bcLogEl.innerHTML += '<div class="text-gray-500">Disconnected.</div>';
+    endBrowserCall();
+  };
+}
+
+function bcPlayNext() {
+  if (!bcAudioQ.length || !bcPlayCtx) { bcPlaying = false; return; }
+  bcPlaying = true;
+  const total = bcAudioQ.reduce((s, c) => s + c.length, 0);
+  const pcm = new Int16Array(total / 2); let off = 0;
+  while (bcAudioQ.length) { const c = bcAudioQ.shift(); pcm.set(new Int16Array(c.buffer, c.byteOffset, c.length / 2), off); off += c.length / 2; }
+  const buf = bcPlayCtx.createBuffer(1, pcm.length, 22050);
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+  const s = bcPlayCtx.createBufferSource();
+  bcCurSrc = s;
+  s.buffer = buf; s.connect(bcPlayCtx.destination);
+  s.onended = () => { bcPlaying = false; bcCurSrc = null; if (bcAudioQ.length) bcPlayNext(); };
+  s.start();
+}
 </script></body></html>"""
 
 
