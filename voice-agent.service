@@ -1,0 +1,17 @@
+[Unit]
+Description=AR Voice Agent Server
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/ar-voice-agent/deploy
+ExecStart=/usr/bin/docker compose up -d --build
+ExecStop=/usr/bin/docker compose down
+Restart=on-failure
+RestartSec=10
+User=azureuser
+
+[Install]
+WantedBy=multi-user.target

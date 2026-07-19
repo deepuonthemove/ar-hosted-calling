@@ -1,0 +1,5 @@
+name: ar-voice-agent-azure
+description: Azure NC4as_T4_v3 GPU VM for HIPAA voice agent
+runtime: python
+config:
+  azure-native:location: eastus

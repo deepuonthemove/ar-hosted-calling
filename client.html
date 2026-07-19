@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Voice Agent Client</title>
+  <style>
+    body { font-family: system-ui; max-width: 600px; margin: 2rem auto; padding: 0 1rem; }
+    #log { height: 300px; overflow-y: auto; background: #1a1a1a; color: #0f0; padding: 1rem; border-radius: 8px; font-size: 14px; font-family: monospace; }
+    .user { color: #8cf; }
+    .llm { color: #fc8; }
+    .state { color: #888; }
+    button { padding: 1rem 2rem; font-size: 1.2rem; border-radius: 8px; border: none; cursor: pointer; background: #2563eb; color: white; }
+    button:disabled { background: #666; cursor: not-allowed; }
+    .talking { background: #dc2626; }
+    #status { margin: 1rem 0; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Healthcare Voice Agent</h1>
+  <button id="toggle" onclick="toggle()">Connect</button>
+  <span id="status">Disconnected</span>
+  <div id="log" style="margin-top: 1rem;"></div>
+
+  <script>
+    let ws = null;
+    let stream = null;
+    let audioCtx = null;
+    let isRecording = false;
+    let sourceNode = null;
+    let processorNode = null;
+
+    const logDiv = document.getElementById('log');
+    const btn = document.getElementById('toggle');
+    const statusEl = document.getElementById('status');
+
+    function log(msg, cls = '') {
+      const d = document.createElement('div');
+      d.className = cls;
+      d.textContent = msg;
+      logDiv.appendChild(d);
+      logDiv.scrollTop = logDiv.scrollHeight;
+    }
+
+    async function toggle() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.close();
+        return;
+      }
+      await connect();
+    }
+
+    async function connect() {
+      const sessionId = crypto.randomUUID();
+      ws = new WebSocket(`ws://${location.hostname}:8080/ws/${sessionId}`);
+      btn.disabled = true;
+      btn.textContent = 'Connecting...';
+      statusEl.textContent = 'Connecting...';
+
+      ws.onopen = async () => {
+        log('Connected', 'state');
+        btn.disabled = false;
+        btn.textContent = 'Disconnect';
+        statusEl.textContent = 'Connected';
+        await startMic();
+      };
+
+      ws.onclose = () => {
+        log('Disconnected', 'state');
+        btn.textContent = 'Connect';
+        statusEl.textContent = 'Disconnected';
+        stopMic();
+        ws = null;
+      };
+
+      ws.onmessage = (evt) => {
+        if (evt.data instanceof Blob) {
+          // Audio chunk
+          return;
+        }
+        const msg = JSON.parse(evt.data);
+        if (msg.type === 'transcript') log(`You: ${msg.text}`, 'user');
+        else if (msg.type === 'llm_text') log(`Agent: ${msg.text}`, 'llm');
+        else if (msg.type === 'barge-in') log('(interrupted)', 'state');
+        else log(`[${msg.type}] ${msg.text}`, 'state');
+      };
+
+      ws.onerror = (e) => {
+        log(`WebSocket error`, 'state');
+        btn.disabled = false;
+      };
+    }
+
+    async function startMic() {
+      audioCtx = new AudioContext({ sampleRate: 16000 });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      sourceNode = audioCtx.createMediaStreamSource(stream);
+      processorNode = audioCtx.createScriptProcessor(4096, 1, 1);
+
+      processorNode.onaudioprocess = (e) => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const input = e.inputBuffer.getChannelData(0);
+        // Convert Float32 to Int16
+        const buf = new Int16Array(input.length);
+        for (let i = 0; i < input.length; i++) {
+          buf[i] = Math.max(-32768, Math.min(32767, input[i] * 32768));
+        }
+        ws.send(buf.buffer);
+      };
+
+      sourceNode.connect(processorNode);
+      processorNode.connect(audioCtx.destination);
+      log('Mic started', 'state');
+    }
+
+    function stopMic() {
+      if (processorNode) { processorNode.disconnect(); processorNode = null; }
+      if (sourceNode) { sourceNode.disconnect(); sourceNode = null; }
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+      if (audioCtx) { audioCtx.close(); audioCtx = null; }
+    }
+  </script>
+</body>
+</html>

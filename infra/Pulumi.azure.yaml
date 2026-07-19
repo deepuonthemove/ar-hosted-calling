@@ -1,0 +1,4 @@
+config:
+  ar-voice-agent-azure:sshPublicKey:
+    secure: AAABAFtsvkfevQ7tagB9UDdOFFtftKW3gD2RFvrefbk=
+  azure-native:location: southindia

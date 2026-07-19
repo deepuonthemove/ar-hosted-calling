@@ -1,0 +1,122 @@
+services:
+  # ── LLM serving (GPU, continuous batching for concurrent calls) ──────
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_TOKEN=${HF_TOKEN:-}
+    command:
+      - --model=${LLM_MODEL:-casperhansen/llama-3.1-8b-instruct-awq}
+      - --gpu-memory-utilization=0.55
+      - --max-model-len=4096
+      - --max-num-seqs=12
+      - --quantization=awq
+      - --dtype=auto
+      - --port=8001
+      - --enforce-eager
+    ports:
+      - "8001:8001"
+    volumes:
+      - model-cache:/root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ── Local Redis (replaces Upstash) ───────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+
+  # ── Voice agent (dev: hot reload) ────────────────────────────────────
+  voice-agent-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: voice-agent-dev
+    runtime: nvidia
+    env_file: .env
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE:-distil-large-v3}
+      - VLLM_BASE_URL=http://vllm:8001/v1
+      - REDIS_URL=redis://redis:6379
+      - LLM_MODEL=${LLM_MODEL:-casperhansen/llama-3.1-8b-instruct-awq}
+    ports:
+      - "8080:8080"
+    depends_on:
+      - vllm
+      - redis
+    volumes:
+      - model-cache:/root/.cache
+      - piper-models:/models/piper
+      - ./:/app
+    profiles: [dev]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ── Voice agent (prod: baked-in code) ────────────────────────────────
+  voice-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: voice-agent
+    runtime: nvidia
+    env_file: .env
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE:-distil-large-v3}
+      - VLLM_BASE_URL=http://vllm:8001/v1
+      - REDIS_URL=redis://redis:6379
+      - LLM_MODEL=${LLM_MODEL:-casperhansen/llama-3.1-8b-instruct-awq}
+    ports:
+      - "8080:8080"
+    depends_on:
+      - vllm
+      - redis
+    volumes:
+      - model-cache:/root/.cache
+      - piper-models:/models/piper
+    profiles: [prod]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ── TLS termination (Twilio requires HTTPS webhook + WSS stream) ─────
+  # Point a DNS A record at the VM IP; Caddy auto-provisions Let's Encrypt.
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy-data:/data
+    depends_on:
+      - voice-agent
+    profiles: [prod, tls]
+
+volumes:
+  model-cache:
+  redis-data:
+  piper-models:
+  caddy-data:

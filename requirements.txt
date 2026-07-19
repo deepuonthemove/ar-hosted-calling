@@ -1,0 +1,11 @@
+fastapi>=0.115
+uvicorn[standard]>=0.34
+websockets>=14.1
+faster-whisper>=1.1
+openai>=1.58
+numpy>=1.26
+redis>=5.2
+openpyxl>=3.1
+twilio>=9.4
+python-multipart>=0.0.20
+piper-tts>=1.2
