@@ -9,3 +9,4 @@ openpyxl>=3.1
 twilio>=9.4
 python-multipart>=0.0.20
 piper-tts>=1.2
+kokoro>=0.3.0

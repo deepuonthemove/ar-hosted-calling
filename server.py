@@ -13,6 +13,7 @@ import io
 import json
 import logging
 import os
+import subprocess
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -34,7 +35,11 @@ WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "distil-large-v3")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "float16")
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://vllm:8001/v1")
-LLM_MODEL = os.getenv("LLM_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct")
+LLM_MODEL = os.getenv("LLM_MODEL", "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4")
+LLM_MODEL_OPTIONS = {
+    "Qwen 2.5 7B": "Qwen/Qwen2.5-7B-Instruct-AWQ",
+    "Llama 3.1 8B": "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
+}
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
@@ -46,6 +51,10 @@ PUBLIC_SCHEME = os.getenv("PUBLIC_SCHEME", "https")
 PIPER_VOICE = os.getenv("PIPER_VOICE", "en_US-lessac-medium")
 PIPER_RATE = int(os.getenv("PIPER_SAMPLE_RATE", "22050"))
 PIPER_DATA_DIR = os.getenv("PIPER_DATA_DIR", "/models/piper")
+
+TTS_ENGINE = os.getenv("TTS_ENGINE", "piper")
+KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_bella")
+KOKORO_RATE = 24000
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ar-voice-agent")
@@ -60,7 +69,17 @@ def load_models():
     state["stt_lock"] = asyncio.Lock()
     state["llm_client"] = AsyncOpenAI(base_url=VLLM_BASE_URL, api_key="not-needed")
     state["llm_model"] = LLM_MODEL
+    state["llm_options"] = LLM_MODEL_OPTIONS
     state["redis"] = aioredis.from_url(REDIS_URL, decode_responses=True)
+
+    try:
+        from kokoro import KPipeline
+        state["kokoro_pipeline"] = KPipeline(lang_code='a', device='cpu')
+        log.info("Kokoro TTS loaded (voice=%s)", KOKORO_VOICE)
+    except Exception as e:
+        log.warning("Kokoro not available, will fall back to Piper: %s", e)
+        state["kokoro_pipeline"] = None
+
     log.info("Models loaded.")
 
 
@@ -93,6 +112,37 @@ async def tts_stream(text: str):
                 await proc.wait()
             except ProcessLookupError:
                 pass
+
+
+# ── Kokoro TTS streaming ────────────────────────────────────────────────
+async def kokoro_stream(text: str):
+    from audio import resample
+    pipeline = state.get("kokoro_pipeline")
+    if not pipeline:
+        log.warning("Kokoro not loaded, falling back to Piper")
+        async for chunk in tts_stream(text):
+            yield chunk
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        results = await loop.run_in_executor(
+            None, lambda: list(pipeline(text, voice=KOKORO_VOICE))
+        )
+    except Exception as e:
+        log.error("Kokoro TTS error: %s", e)
+        return
+    for result in results:
+        if result.audio is None or len(result.audio) == 0:
+            continue
+        audio = result.audio
+        if KOKORO_RATE != PIPER_RATE:
+            audio = resample(audio, KOKORO_RATE, PIPER_RATE)
+        pcm = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+        yield pcm.tobytes()
+
+
+def get_tts_fn(engine: str):
+    return {"piper": tts_stream, "kokoro": kokoro_stream}.get(engine, tts_stream)
 
 
 # ── End-of-call detection ────────────────────────────────────────────────
@@ -203,13 +253,17 @@ async def voice_webhook(request: Request):
 @app.websocket("/media/{call_sid}")
 async def media_stream(ws: WebSocket, call_sid: str):
     """Twilio Media Streams WebSocket → CallSession (ported from DO)."""
+    engine = TTS_ENGINE
+    call_record = await state["redis"].hgetall(f"call:{call_sid}")
+    if call_record and call_record.get("tts_engine"):
+        engine = call_record["tts_engine"]
     session = CallSession(ws, call_sid, {
         "redis": state["redis"],
         "stt_model": state["stt_model"],
         "stt_lock": state["stt_lock"],
         "llm_client": state["llm_client"],
         "llm_model": state["llm_model"],
-        "tts_stream_fn": tts_stream,
+        "tts_stream_fn": get_tts_fn(engine),
     })
     await session.run()
 
@@ -389,7 +443,71 @@ async def export_excel():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "whisper": WHISPER_MODEL_SIZE, "llm": LLM_MODEL}
+    return {"status": "ok", "whisper": WHISPER_MODEL_SIZE, "llm": state["llm_model"]}
+
+
+@app.get("/api/current-llm")
+async def current_llm():
+    return {
+        "model": state["llm_model"],
+        "options": state["llm_options"],
+        "switching": state.get("llm_switching", False),
+    }
+
+
+@app.post("/api/switch-llm")
+async def switch_llm(request: Request):
+    data = await request.json()
+    model_name = data.get("model", "")
+    # Find the full model ID from options
+    model_id = None
+    for label, mid in state["llm_options"].items():
+        if model_name in (label, mid):
+            model_id = mid
+            break
+    if not model_id:
+        return JSONResponse({"error": f"Unknown model: {model_name}"}, 400)
+    if model_id == state["llm_model"]:
+        return {"ok": True, "model": model_id, "switching": False}
+
+    state["llm_switching"] = True
+    # Write to .env on host
+    try:
+        import subprocess
+        env_path = "/project/.env"
+        with open(env_path) as f:
+            lines = f.readlines()
+        found = False
+        for i, line in enumerate(lines):
+            if line.startswith("LLM_MODEL="):
+                lines[i] = f"LLM_MODEL={model_id}\n"
+                found = True
+                break
+        if not found:
+            lines.append(f"LLM_MODEL={model_id}\n")
+        with open(env_path, "w") as f:
+            f.writelines(lines)
+    except Exception as e:
+        log.warning("Could not update .env: %s", e)
+
+    # Update in-memory model
+    old_model = state["llm_model"]
+    state["llm_model"] = model_id
+
+    # Restart vLLM in background
+    async def _restart_vllm():
+        try:
+            import subprocess
+            subprocess.run(["docker", "restart", "vllm"], timeout=120)
+            log.info("vLLM restarted with model %s", model_id)
+        except Exception as e:
+            log.error("vLLM restart failed: %s", e)
+            state["llm_model"] = old_model
+        finally:
+            state["llm_switching"] = False
+
+    asyncio.create_task(_restart_vllm())
+    return {"ok": True, "model": model_id, "switching": True}
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -462,16 +580,21 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
     await ws.accept()
     await ws.send_json({"type": "config", "sample_rate": PIPER_RATE})
 
-    # Parse account_uid from WebSocket URL query params
+    # Parse query params from WebSocket URL
     account_uid = ""
+    tts_engine = TTS_ENGINE
     try:
         qs = str(ws.url).split("?")[1] if "?" in str(ws.url) else ""
         for part in qs.split("&"):
             k, _, v = part.partition("=")
             if k == "account_uid" and v:
                 account_uid = v
+            elif k == "tts" and v:
+                tts_engine = v
     except Exception:
         pass
+
+    tts_fn = get_tts_fn(tts_engine)
 
     account = None
     if account_uid:
@@ -484,7 +607,7 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
     greeting = build_greeting(account)
     conversation.append({"role": "assistant", "content": greeting})
     await ws.send_json({"type": "llm_text", "text": greeting})
-    tts_task = asyncio.create_task(_stream_tts_reply(ws, greeting))
+    tts_task = asyncio.create_task(_stream_tts_reply(ws, greeting, tts_fn))
 
     vad = VAD()
     barge_in = False
@@ -538,16 +661,17 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                 await ws.close()
                 return
 
-            conversation.append({"role": "user", "content": text})
+            conversation.append({"role": "user", "content": f"[INSURANCE REP] {text}"})
             await ws.send_json({"type": "transcript", "text": text})
+            conv = conversation if len(conversation) <= 7 else [conversation[0]] + conversation[-6:]
             resp = await state["llm_client"].chat.completions.create(
-                model=LLM_MODEL, messages=conversation[-7:], max_tokens=150, temperature=0)
+                model=state["llm_model"], messages=conv, max_tokens=150, temperature=0)
             reply = resp.choices[0].message.content.strip()
             conversation.append({"role": "assistant", "content": reply})
             await ws.send_json({"type": "llm_text", "text": reply})
 
             # Stream TTS in background so audio reads continue
-            tts_task = asyncio.create_task(_stream_tts_reply(ws, reply))
+            tts_task = asyncio.create_task(_stream_tts_reply(ws, reply, tts_fn))
 
     except Exception:
         pass
@@ -560,9 +684,9 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                 pass
 
 
-async def _stream_tts_reply(ws: WebSocket, text: str):
+async def _stream_tts_reply(ws: WebSocket, text: str, tts_fn=tts_stream):
     try:
-        async for pcm_bytes in tts_stream(text):
+        async for pcm_bytes in tts_fn(text):
             await ws.send_bytes(b"\x01" + pcm_bytes)
     except asyncio.CancelledError:
         pass
@@ -601,6 +725,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             Place Outbound Call</button>
         </form>
         <div id="msg" class="mt-3 text-xs hidden"></div>
+      </div>
+
+      <!-- TTS Engine Selector -->
+      <div class="bg-gray-800 p-4 rounded-lg">
+        <label class="text-xs text-gray-400 block mb-1">TTS Engine</label>
+        <select id="tts-engine" class="w-full bg-gray-900 border border-gray-700 rounded p-2 text-sm">
+          <option value="piper">Piper (fast, robotic)</option>
+          <option value="kokoro">Kokoro (natural)</option>
+        </select>
+      </div>
+
+      <!-- LLM Model Selector -->
+      <div class="bg-gray-800 p-4 rounded-lg">
+        <label class="text-xs text-gray-400 block mb-1">LLM Model</label>
+        <div class="flex gap-2">
+          <select id="llm-model" class="flex-1 bg-gray-900 border border-gray-700 rounded p-2 text-sm"></select>
+          <button id="switch-llm-btn" onclick="switchLLM()"
+            class="px-3 py-1 bg-yellow-700 hover:bg-yellow-600 rounded text-xs font-bold disabled:opacity-50"
+            disabled>Switch</button>
+        </div>
+        <div id="llm-status" class="mt-1 text-xs text-gray-500"></div>
       </div>
 
       <!-- Browser Call Button -->
@@ -776,8 +921,12 @@ function endBrowserCall() {
 async function startBrowserCall() {
   const sid = 'browser_' + Math.random().toString(36).slice(2);
   const uid = ($('account_uid') && $('account_uid').value) || '';
+  const tts = ($('tts-engine') && $('tts-engine').value) || 'piper';
+  const params = new URLSearchParams();
+  if (uid) params.set('account_uid', uid);
+  params.set('tts', tts);
   bcPlayCtx = new AudioContext(); // create inside user gesture — ensures running state
-  bcWS = new WebSocket('wss://' + location.host + '/ws/' + sid + (uid ? '?account_uid=' + uid : ''));
+  bcWS = new WebSocket('wss://' + location.host + '/ws/' + sid + '?' + params.toString());
   bcWS.binaryType = 'arraybuffer';
 
   $('browser-call-panel').classList.remove('hidden');
@@ -841,6 +990,38 @@ function bcPlayNext() {
   s.onended = () => { bcPlaying = false; bcCurSrc = null; if (bcAudioQ.length) bcPlayNext(); };
   s.start();
 }
+
+// ── LLM Model Switcher ──────────────────────────────────────────────
+async function loadLLM() {
+  const sel = $('llm-model');
+  const st = $('llm-status');
+  const btn = $('switch-llm-btn');
+  try {
+    const r = await (await fetch('/api/current-llm')).json();
+    sel.innerHTML = Object.keys(r.options).map(l =>
+      `<option value="${r.options[l]}" ${r.options[l]===r.model?'selected':''}>${l}</option>`
+    ).join('');
+    btn.disabled = false;
+    st.textContent = r.switching ? '🔄 Switching...' : r.model;
+    if (r.switching) setTimeout(loadLLM, 2000);
+  } catch (e) { st.textContent = 'Failed to load'; }
+}
+async function switchLLM() {
+  const sel = $('llm-model');
+  const st = $('llm-status');
+  const btn = $('switch-llm-btn');
+  btn.disabled = true;
+  st.textContent = '🔄 Switching model, vLLM restarting (~1 min)...';
+  try {
+    const r = await (await fetch('/api/switch-llm', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model: sel.value})
+    })).json();
+    if (r.error) { st.textContent = 'Error: ' + r.error; btn.disabled = false; return; }
+    setTimeout(loadLLM, 3000);
+  } catch (e) { st.textContent = 'Error: ' + e.message; btn.disabled = false; }
+}
+loadLLM();
 </script></body></html>"""
 
 

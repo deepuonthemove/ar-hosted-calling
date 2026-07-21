@@ -190,8 +190,7 @@ class CallSession:
         await self._check_verify_on_transcript(user_text)
 
         # Qwen supports system role natively. Prepend state info to user message.
-        state_tag = f"[STATE: {self.state}]"
-        self.conversation.append({"role": "user", "content": f"{state_tag} {user_text}"})
+        self.conversation.append({"role": "user", "content": f"[INSURANCE REP] [STATE: {self.state}] {user_text}"})
 
         try:
             stream = await self.llm_client.chat.completions.create(
