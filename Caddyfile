@@ -1,3 +1,5 @@
-{$PUBLIC_DOMAIN} {
+# Requires PUBLIC_DOMAIN set in .env (e.g. voice.example.com pointing at this VM).
+# Falls back to localhost (no TLS) so the container starts even when unset.
+{$PUBLIC_DOMAIN:localhost} {
 	reverse_proxy voice-agent:8080
 }

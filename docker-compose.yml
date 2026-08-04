@@ -104,7 +104,9 @@ services:
               capabilities: [gpu]
 
   # ── TLS termination (Twilio requires HTTPS webhook + WSS stream) ─────
-  # Point a DNS A record at the VM IP; Caddy auto-provisions Let's Encrypt.
+  # Point a DNS A record at the VM IP and set PUBLIC_DOMAIN in .env.
+  # Only runs when the `tls` profile is enabled:
+  #   docker compose --profile prod --profile tls up -d
   caddy:
     image: caddy:2-alpine
     container_name: caddy
@@ -115,9 +117,11 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy-data:/data
+    environment:
+      - PUBLIC_DOMAIN=${PUBLIC_DOMAIN:-}
     depends_on:
       - voice-agent
-    profiles: [prod, tls]
+    profiles: [tls]
 
 volumes:
   model-cache:

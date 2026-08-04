@@ -169,6 +169,66 @@ def _is_end_of_call(user_text: str, conversation: list[dict]) -> bool:
     return False
 
 
+# ── Offline STT (full audio, no VAD) ────────────────────────────────────
+async def transcribe_full_audio(audio_bytes: bytes) -> str:
+    if len(audio_bytes) < 320:
+        return ""
+    pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    async with state["stt_lock"]:
+        loop = asyncio.get_running_loop()
+        segments, _ = await loop.run_in_executor(
+            None, lambda: state["stt_model"].transcribe(
+                pcm, beam_size=5, vad_filter=False, language="en"
+            ),
+        )
+        return " ".join(s.text for s in segments).strip()
+
+
+async def _save_review(session_id: str, conversation: list[dict], full_audio: bytes, call_duration: float):
+    """Save audio buffer, spawn offline STT, store review data."""
+    r = state["redis"]
+    audio_key = f"call:{session_id}:audio"
+    review_key = f"call:{session_id}:review"
+
+    # Save audio to Redis (24h TTL)
+    if full_audio:
+        await r.setex(audio_key, 86400, full_audio)
+
+    # Extract real-time user utterances and AI responses
+    real_time = []
+    ai_responses = []
+    for msg in conversation:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "user":
+            cleaned = content.replace("[INSURANCE REP] ", "", 1)
+            real_time.append(cleaned)
+        elif role == "assistant":
+            ai_responses.append(content)
+
+    # Run offline STT in background
+    async def _offline_stt():
+        try:
+            if not full_audio or len(full_audio) < 320:
+                review = {"real_time": real_time, "full_audio": "", "ai_responses": ai_responses,
+                          "duration_sec": int(call_duration), "audio_size_bytes": len(full_audio)}
+                await r.set(review_key, json.dumps(review))
+                return
+            log.info("[%s] Offline STT on %d bytes...", session_id, len(full_audio))
+            transcript = await transcribe_full_audio(full_audio)
+            review = {"real_time": real_time, "full_audio": transcript, "ai_responses": ai_responses,
+                      "duration_sec": int(call_duration), "audio_size_bytes": len(full_audio)}
+            await r.set(review_key, json.dumps(review))
+            log.info("[%s] Offline STT done (%d chars)", session_id, len(transcript))
+        except Exception as e:
+            log.error("[%s] Offline STT error: %s", session_id, e)
+            review = {"real_time": real_time, "full_audio": "", "ai_responses": ai_responses,
+                      "duration_sec": int(call_duration), "audio_size_bytes": len(full_audio), "error": str(e)}
+            await r.set(review_key, json.dumps(review))
+
+    asyncio.create_task(_offline_stt())
+
+
 # ── App lifecycle ────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -578,6 +638,15 @@ async def switch_llm(request: Request):
     return {"ok": True, "model": model_id, "switching": True}
 
 
+@app.get("/api/calls/{session_id}/review")
+async def get_review(session_id: str):
+    review_key = f"call:{session_id}:review"
+    data = await state["redis"].get(review_key)
+    if not data:
+        return JSONResponse({"error": "Review not found"}, 404)
+    return JSONResponse(json.loads(data))
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     return DASHBOARD_HTML
@@ -679,6 +748,9 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
 
     vad = VAD()
     barge_in = False
+    full_audio = bytearray()
+    call_start = time.time()
+    review_saved = False
 
     async def cancel_tts():
         nonlocal tts_task
@@ -690,9 +762,17 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                 pass
             tts_task = None
 
+    async def _finalize_review():
+        nonlocal review_saved
+        if review_saved:
+            return
+        review_saved = True
+        await _save_review(session_id, conversation, bytes(full_audio), time.time() - call_start)
+
     try:
         while True:
             raw = await ws.receive_bytes()
+            full_audio.extend(raw)
             audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
             now = time.time()
             energy = rms(audio)
@@ -725,6 +805,7 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             if _is_end_of_call(text, conversation):
                 await cancel_tts()
                 await ws.send_json({"type": "llm_text", "text": "Call ended. Have a great day!"})
+                await _finalize_review()
                 await asyncio.sleep(1)
                 await ws.close()
                 return
@@ -744,6 +825,7 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
     except Exception:
         pass
     finally:
+        await _finalize_review()
         if tts_task and not tts_task.done():
             tts_task.cancel()
             try:
@@ -845,6 +927,34 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="bg-gray-800 rounded-lg p-4">
         <h2 class="text-lg font-bold mb-3">Live Call Feed</h2>
         <div id="call-rows" class="space-y-3 max-h-[300px] overflow-y-auto"></div>
+      </div>
+
+      <!-- Review Tab -->
+      <div class="bg-gray-800 rounded-lg p-4">
+        <h2 class="text-lg font-bold mb-3">Call Review
+          <span class="text-xs text-gray-400 font-normal">(browser calls only)</span></h2>
+        <div id="review-list" class="space-y-2 max-h-[200px] overflow-y-auto"></div>
+        <div id="review-detail" class="hidden mt-4 border-t border-gray-700 pt-4">
+          <div class="flex justify-between items-center mb-3">
+            <h3 class="text-md font-bold">Transcript Comparison</h3>
+            <button onclick="closeReview()" class="px-2 py-1 bg-gray-700 rounded text-xs">✕ Close</button>
+          </div>
+          <div class="grid grid-cols-2 gap-4">
+            <div class="bg-gray-900 rounded p-3">
+              <div class="text-xs text-blue-300 font-bold mb-2">🔴 Real-Time STT (with VAD)</div>
+              <div id="review-real-time" class="text-xs leading-relaxed whitespace-pre-wrap"></div>
+            </div>
+            <div class="bg-gray-900 rounded p-3">
+              <div class="text-xs text-green-300 font-bold mb-2">🟢 Full Recording STT (no VAD)</div>
+              <div id="review-full-audio" class="text-xs leading-relaxed whitespace-pre-wrap"></div>
+            </div>
+          </div>
+          <div class="mt-3 bg-gray-900 rounded p-3">
+            <div class="text-xs text-orange-300 font-bold mb-2">🤖 AI Responses</div>
+            <div id="review-ai-responses" class="text-xs leading-relaxed whitespace-pre-wrap"></div>
+          </div>
+          <div class="mt-2 text-[10px] text-gray-500" id="review-meta"></div>
+        </div>
       </div>
     </div>
     <div class="lg:col-span-2 space-y-6">
@@ -1090,6 +1200,82 @@ async function switchLLM() {
   } catch (e) { st.textContent = 'Error: ' + e.message; btn.disabled = false; }
 }
 loadLLM();
+
+// ── Review Tab ──────────────────────────────────────────────────────
+function highlightDiff(realText, fullText) {
+  const realWords = (realText || '').split(/\s+/).filter(Boolean);
+  const fullWords = (fullText || '').split(/\s+/).filter(Boolean);
+  const fullSet = new Set(fullWords.map(w => w.toLowerCase()));
+  const realSet = new Set(realWords.map(w => w.toLowerCase()));
+  const missed = realWords.filter(w => !fullSet.has(w.toLowerCase()));
+  const extra = fullWords.filter(w => !realSet.has(w.toLowerCase()));
+
+  const highlight = (words, highlights, cls) =>
+    words.map(w => highlights.some(h => h.toLowerCase() === w.toLowerCase())
+      ? `<span class="${cls}">${w}</span>` : w).join(' ');
+
+  const hReal = highlight(realWords, missed, 'text-red-400 font-bold');
+  const hFull = highlight(fullWords, extra, 'text-green-400 font-bold');
+  return { hReal, hFull, missed: missed.length, extra: extra.length };
+}
+
+async function fetchReviews() {
+  try {
+    const calls = await (await fetch('/api/calls')).json();
+    const browserCalls = calls.filter(c => c.callSid && c.callSid.startsWith('browser_'));
+    const list = $('review-list');
+    if (!browserCalls.length) {
+      list.innerHTML = '<div class="text-gray-500 text-xs">No browser calls yet</div>';
+      return;
+    }
+    list.innerHTML = browserCalls.slice(0, 10).map(c =>
+      `<div class="flex justify-between items-center bg-gray-900 rounded p-2 text-xs">
+        <span class="text-gray-400">${c.callSid.slice(0, 20)}…</span>
+        <span class="${c.status==='completed'?'text-green-400':'text-yellow-400'}">${c.status}</span>
+        <button onclick="openReview('${c.callSid}')"
+          class="px-2 py-0.5 bg-blue-700 hover:bg-blue-600 rounded text-[10px]">Review</button>
+      </div>`
+    ).join('');
+  } catch (e) {}
+}
+
+async function openReview(sid) {
+  const detail = $('review-detail');
+  const rTime = $('review-real-time');
+  const rFull = $('review-full-audio');
+  const rAI = $('review-ai-responses');
+  const rMeta = $('review-meta');
+  detail.classList.remove('hidden');
+  rTime.textContent = 'Loading...';
+  rFull.textContent = '';
+  rAI.textContent = '';
+  rMeta.textContent = '';
+  try {
+    const d = await (await fetch(`/api/calls/${sid}/review`)).json();
+    if (d.error) { rTime.textContent = 'Review not available'; return; }
+
+    const userText = (d.real_time || []).join('\\n');
+    const fullText = d.full_audio || '';
+
+    const diff = highlightDiff(userText, fullText);
+    rTime.innerHTML = diff.hReal || '<span class="text-gray-500">(no speech detected)</span>';
+    rFull.innerHTML = diff.hFull || '<span class="text-gray-500">(no speech detected)</span>';
+    rAI.textContent = (d.ai_responses || []).join('\\n') || '(none)';
+
+    const dur = d.duration_sec ? Math.round(d.duration_sec / 60 * 10) / 10 + 'm' : '?';
+    const size = d.audio_size_bytes ? (d.audio_size_bytes / 1024 / 1024).toFixed(1) + 'MB' : '?';
+    const words = fullText ? fullText.split(/\s+/).length : 0;
+    rMeta.textContent = `Duration: ${dur} · Audio: ${size} · Words: ${words} · ` +
+      `Missed: ${diff.missed} · Extra: ${diff.extra}`;
+  } catch (e) { rTime.textContent = 'Error loading review'; }
+}
+
+function closeReview() {
+  $('review-detail').classList.add('hidden');
+}
+
+fetchReviews();
+setInterval(fetchReviews, 5000);
 </script></body></html>"""
 
 
