@@ -1,0 +1,109 @@
+{
+  "denial_context": {
+    "CO-4": {
+      "code": "CO-4",
+      "category": "Contractual Obligation",
+      "description": "The procedure code is inconsistent with the modifier used or a required modifier is missing.",
+      "script_guideline": "Ask the representative specifically which modifier is required or missing (e.g., modifier 25, 59, 50), and verify if a corrected claim with the updated modifier can be submitted electronically.",
+      "recommended_action": "resubmit_with_modifier"
+    },
+    "CO-11": {
+      "code": "CO-11",
+      "category": "Contractual Obligation",
+      "description": "The diagnosis code is inconsistent with the procedure performed.",
+      "script_guideline": "Ask the representative which primary diagnosis code was expected for this CPT code, and request the specific LCD/NCD medical necessity policy reference.",
+      "recommended_action": "review_medical_necessity"
+    },
+    "CO-16": {
+      "code": "CO-16",
+      "category": "Contractual Obligation",
+      "description": "Claim/service lacks information or has submission errors which is needed for adjudication.",
+      "script_guideline": "Ask the representative exactly what documentation or information is missing (e.g., medical records, operative report, itemized bill, invoice), and confirm the fax number or portal link for submission.",
+      "recommended_action": "send_medical_records"
+    },
+    "CO-18": {
+      "code": "CO-18",
+      "category": "Contractual Obligation",
+      "description": "Exact duplicate claim/service.",
+      "script_guideline": "Ask for the original processed claim number and the status/payment details of that original claim to verify if it was paid or denied.",
+      "recommended_action": "verify_duplicate_status"
+    },
+    "CO-22": {
+      "code": "CO-22",
+      "category": "Contractual Obligation",
+      "description": "This care may be covered by another payer per coordination of benefits.",
+      "script_guideline": "Ask which payer is listed as primary on file, and confirm if COB information needs to be updated by the patient or if primary EOB must be attached.",
+      "recommended_action": "cob_update_primary_eob"
+    },
+    "CO-27": {
+      "code": "CO-27",
+      "category": "Contractual Obligation",
+      "description": "Expenses incurred after coverage terminated.",
+      "script_guideline": "Ask for the exact termination date on file and whether there is any active tail or secondary coverage under a different policy ID.",
+      "recommended_action": "verify_patient_eligibility"
+    },
+    "CO-29": {
+      "code": "CO-29",
+      "category": "Contractual Obligation",
+      "description": "The time limit for filing has expired.",
+      "script_guideline": "Ask for the timely filing limit for this payer (e.g., 90 days, 180 days, 365 days), state the initial submission date, and ask if proof of timely filing can be submitted for reconsideration.",
+      "recommended_action": "submit_timely_filing_appeal"
+    },
+    "CO-45": {
+      "code": "CO-45",
+      "category": "Contractual Obligation",
+      "description": "Charge exceeds fee schedule / maximum allowable amount.",
+      "script_guideline": "Ask for the exact contracted fee schedule amount applied, confirm if any contractual adjustment was taken correctly, and verify whether any remaining balance is patient responsibility or non-covered.",
+      "recommended_action": "review_fee_schedule_adjustment"
+    },
+    "CO-50": {
+      "code": "CO-50",
+      "category": "Contractual Obligation",
+      "description": "These are non-covered services because this is not deemed a 'medical necessity' by the payer.",
+      "script_guideline": "Ask for the specific clinical guideline or clinical policy bulletin reference, and request instructions for filing a peer-to-peer review or formal medical appeal.",
+      "recommended_action": "file_medical_necessity_appeal"
+    },
+    "CO-97": {
+      "code": "CO-97",
+      "category": "Contractual Obligation",
+      "description": "The benefit for this service is included in the payment/allowance for another service/procedure that has already been adjudicated (bundling).",
+      "script_guideline": "Ask which specific CPT code this line item was bundled into, and ask if modifier 59 or XE/XS/XP/XU can be appended with documentation to unbundle.",
+      "recommended_action": "appeal_unbundling_modifier"
+    },
+    "CO-109": {
+      "code": "CO-109",
+      "category": "Contractual Obligation",
+      "description": "Claim not covered by this payer/contract.",
+      "script_guideline": "Ask for the correct payer name, electronic payer ID, or claims submission address for this member.",
+      "recommended_action": "re-route_to_correct_payer"
+    },
+    "PR-1": {
+      "code": "PR-1",
+      "category": "Patient Responsibility",
+      "description": "Deductible amount.",
+      "script_guideline": "Confirm that the entire amount was applied to the patient's annual deductible, verify the remaining deductible for the year, and confirm statement can be sent to patient.",
+      "recommended_action": "bill_patient_deductible"
+    },
+    "PR-2": {
+      "code": "PR-2",
+      "category": "Patient Responsibility",
+      "description": "Coinsurance amount.",
+      "script_guideline": "Confirm the coinsurance percentage applied (e.g., 20%), verify the total patient liability amount, and confirm statement can be sent to patient.",
+      "recommended_action": "bill_patient_coinsurance"
+    },
+    "PR-3": {
+      "code": "PR-3",
+      "category": "Patient Responsibility",
+      "description": "Co-payment amount.",
+      "script_guideline": "Confirm the flat co-pay amount applied to this visit type.",
+      "recommended_action": "bill_patient_copay"
+    },
+    "OA-23": {
+      "code": "OA-23",
+      "category": "Other Adjustment",
+      "description": "Payment adjusted because the impact of prior payer adjudication was not provided.",
+      "script_guideline": "Ask if submitting the primary EOB with secondary claim will resolve the adjudication.",
+      "recommended_action": "submit_primary_eob"
+    }
+  }
+}

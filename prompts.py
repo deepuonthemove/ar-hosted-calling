@@ -58,6 +58,7 @@ PAYERS_DIR = Path(__file__).parent / "payers"
 
 _payer_cache: dict[str, dict] = {}
 _denial_codes: dict[str, str] = {}
+_denial_context: dict[str, dict] = {}
 
 
 def load_denial_codes() -> dict[str, str]:
@@ -73,6 +74,19 @@ def load_denial_codes() -> dict[str, str]:
     return _denial_codes
 
 
+def load_denial_context() -> dict[str, dict]:
+    global _denial_context
+    if _denial_context:
+        return _denial_context
+    try:
+        with open(PAYERS_DIR / "denial_context.json") as f:
+            data = json.load(f)
+            _denial_context = data.get("denial_context", {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        _denial_context = {}
+    return _denial_context
+
+
 def load_payer(payer_name: str) -> dict | None:
     if not payer_name:
         return None
@@ -85,7 +99,7 @@ def load_payer(payer_name: str) -> dict | None:
             if fp.stem.lower() == slug:
                 path = fp
                 break
-    if not path.exists() or path.name == "denial_codes.json":
+    if not path.exists() or path.name in ("denial_codes.json", "denial_context.json"):
         return None
     try:
         with open(path) as f:
@@ -115,16 +129,34 @@ def build_call_prompt(state: str, payer_knowledge: dict | None,
     parts = [base]
 
     if account:
+        denial_info = ""
+        known_denial = account.get("Denial Code") or account.get("denialCode")
+        if known_denial:
+            denial_info = f"\nKnown Denial Code: {known_denial}"
+
         parts.append(
             f"[CLAIM CONTEXT]\n"
-            f"Patient: {account.get('Patient Name', 'unknown')}\n"
-            f"DOS: {account.get('DOS', 'unknown')}\n"
-            f"CPT: {account.get('CPT', 'unknown')}\n"
-            f"Billed: ${account.get('Billed Amount', '0')}\n"
-            f"Payer: {account.get('Responsible Payer', 'unknown')}\n"
-            f"Account: {account.get('Account Number', 'unknown')}\n"
-            f"Objective: {account.get('AR Final Comments', 'Check claim status')}"
+            f"Patient: {account.get('Patient Name', account.get('patientName', 'unknown'))}\n"
+            f"DOS: {account.get('DOS', account.get('dos', 'unknown'))}\n"
+            f"CPT: {account.get('CPT', account.get('cpt', 'unknown'))}\n"
+            f"Billed: ${account.get('Billed Amount', account.get('billedAmount', '0'))}\n"
+            f"Payer: {account.get('Responsible Payer', account.get('provider', 'unknown'))}\n"
+            f"Account: {account.get('Account Number', account.get('accountNumber', 'unknown'))}\n"
+            f"Objective: {account.get('AR Final Comments', 'Check claim status')}{denial_info}"
         )
+
+        # Inject AR Learning Denial Rules if a denial code is known
+        if known_denial:
+            ctx_dict = load_denial_context()
+            match_ctx = ctx_dict.get(known_denial.upper())
+            if match_ctx:
+                parts.append(
+                    f"[DENIAL GUIDANCE FOR {known_denial}]\n"
+                    f"Category: {match_ctx.get('category', 'Unknown')}\n"
+                    f"Description: {match_ctx.get('description', '')}\n"
+                    f"Voice Script Guideline: {match_ctx.get('script_guideline', '')}\n"
+                    f"Recommended Action: {match_ctx.get('recommended_action', '')}"
+                )
 
     if payer_knowledge and payer_knowledge.get("ivr_tree"):
         tree = payer_knowledge["ivr_tree"]
@@ -141,11 +173,17 @@ def build_call_prompt(state: str, payer_knowledge: dict | None,
 
     if denial_code_subset:
         codes = load_denial_codes()
-        parts.append("[DENIAL CODES]")
+        ctxs = load_denial_context()
+        parts.append("[DENIAL CODES KNOWLEDGE BASE]")
         for code in denial_code_subset:
             desc = codes.get(code, "")
-            if desc:
-                parts.append(f"  {code}: {desc}")
+            ctx = ctxs.get(code.upper(), {})
+            guideline = ctx.get("script_guideline", "")
+            if desc or guideline:
+                line = f"  {code}: {desc}"
+                if guideline:
+                    line += f" | Script Advice: {guideline}"
+                parts.append(line)
 
     return "\n\n".join(parts)
 

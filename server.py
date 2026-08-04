@@ -213,11 +213,79 @@ async def make_call(request: Request):
                    f"?payer={payer}&claim_id={claim_id}&account_uid={account_uid}"
                    f"&local_sid={call_sid}")
         call = client.calls.create(to=phone, from_=TWILIO_FROM_NUMBER, url=webhook)
-        # Re-key record to the real Twilio SID
         await state["redis"].rename(f"call:{call_sid}", f"call:{call.sid}")
         return {"ok": True, "callSid": call.sid}
     except TwilioRestException as e:
         return JSONResponse({"error": f"Twilio API error: {e.msg}"}, 500)
+
+
+@app.post("/make-call-enriched")
+async def make_call_enriched(request: Request):
+    """Trigger outbound call after storing enriched claim data into Redis."""
+    data = await request.json()
+    phone = data.get("phone")
+    claim_id = data.get("claim_id") or data.get("claimId")
+    if not phone or not claim_id:
+        return JSONResponse({"error": "Phone number and claim_id are required"}, 400)
+
+    account_uid = data.get("account_uid") or data.get("accountUid") or f"claim-{claim_id}"
+    payer = data.get("payer") or data.get("provider") or "unknown"
+    enriched_data = data.get("enrichedData") or {}
+
+    # Map enriched fields into account dictionary
+    record = {
+        "UID": account_uid,
+        "Claim ID": claim_id,
+        "Responsible Payer": payer,
+        "Patient Name": enriched_data.get("patientName") or data.get("patientName") or "Unknown Patient",
+        "DOS": enriched_data.get("dos") or data.get("dos") or "",
+        "Billed Amount": str(enriched_data.get("billedAmount") or data.get("billedAmount") or "0.00"),
+        "CPT": enriched_data.get("cpt") or data.get("cpt") or "",
+        "Account Number": enriched_data.get("accountNumber") or data.get("accountNumber") or "",
+        "Denial Code": enriched_data.get("denialCode") or data.get("denialCode") or "",
+        "Call Status": "Pending",
+    }
+
+    # Store into Redis hash so CallSession can pick it up
+    r = state["redis"]
+    await r.hset(f"account:{account_uid}", mapping=record)
+
+    # Call standard make_call logic
+    call_sid = f"local-{uuid.uuid4().hex[:16]}"
+    await r.hset(f"call:{call_sid}", mapping={
+        "claim_id": claim_id, "payer": payer, "account_uid": account_uid,
+        "phone": phone, "status": "dialing", "started_at": str(time.time()),
+    })
+
+    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER]):
+        return JSONResponse({"ok": True, "callSid": call_sid, "warning": "Twilio not configured; mock mode active"})
+
+    from twilio.rest import Client as TwilioClient
+    from twilio.base.exceptions import TwilioRestException
+    try:
+        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        webhook = (f"{PUBLIC_SCHEME}://{PUBLIC_DOMAIN}/voice"
+                   f"?payer={payer}&claim_id={claim_id}&account_uid={account_uid}"
+                   f"&local_sid={call_sid}")
+        call = client.calls.create(to=phone, from_=TWILIO_FROM_NUMBER, url=webhook)
+        await r.rename(f"call:{call_sid}", f"call:{call.sid}")
+        return {"ok": True, "callSid": call.sid}
+    except TwilioRestException as e:
+        return JSONResponse({"error": f"Twilio API error: {e.msg}"}, 500)
+
+
+@app.get("/api/enriched-claim/{claim_id}")
+async def get_enriched_claim(claim_id: str):
+    """Retrieve enriched claim data stored in Redis."""
+    r = state["redis"]
+    account_keys = await r.keys("account:*")
+    for key in account_keys:
+        data = await r.hgetall(key)
+        if data.get("Claim ID") == claim_id or data.get("claimId") == claim_id:
+            return {"claimId": claim_id, "data": data}
+    return JSONResponse({"error": "Claim not found"}, 404)
+
+
 
 
 @app.api_route("/voice", methods=["GET", "POST"])

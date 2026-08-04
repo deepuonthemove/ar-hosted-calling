@@ -69,7 +69,47 @@ def piper_to_twilio(pcm_int16: np.ndarray, piper_rate: int) -> bytes:
     return pcm16_to_mulaw(pcm8k.astype(np.int16))
 
 
-# ── Energy-based VAD ─────────────────────────────────────────────────────
+# ── VAD (Silero VAD with RMS Energy Fallback) ──────────────────────────
+_silero_model = None
+_silero_utils = None
+
+
+def load_silero_vad():
+    global _silero_model, _silero_utils
+    if _silero_model is not None:
+        return _silero_model, _silero_utils
+    try:
+        import torch
+        model, utils = torch.hub.load(
+            repo_or_dir='snakers4/silero-vad',
+            model='silero_vad',
+            force_reload=False,
+            trust_repo=True,
+            onnx=False
+        )
+        _silero_model = model
+        _silero_utils = utils
+        return _silero_model, _silero_utils
+    except Exception as e:
+        print(f"[VAD] Silero VAD load failed ({e}); falling back to RMS energy VAD")
+        return None, None
+
+
+def is_speech_silero(chunk: np.ndarray, sample_rate: int = 16000) -> float:
+    """Returns speech probability 0.0 - 1.0 using Silero VAD on CPU."""
+    model, _ = load_silero_vad()
+    if model is None:
+        return 0.0
+    try:
+        import torch
+        tensor = torch.from_numpy(chunk).float()
+        with torch.no_grad():
+            prob = model(tensor, sample_rate).item()
+        return float(prob)
+    except Exception:
+        return 0.0
+
+
 def rms(audio: np.ndarray) -> float:
     if len(audio) == 0:
         return 0.0
@@ -77,20 +117,33 @@ def rms(audio: np.ndarray) -> float:
 
 
 class VAD:
-    """Accumulates speech; returns segment when silence ends utterance."""
+    """Accumulates speech; returns segment when silence ends utterance.
+    Uses Silero VAD if available, falling back to RMS energy thresholding.
+    """
 
-    def __init__(self, energy_threshold=0.015, min_speech_ms=400,
-                 min_silence_ms=700, max_speech_ms=10_000):
+    def __init__(self, energy_threshold=0.015, speech_threshold=0.5,
+                 min_speech_ms=400, min_silence_ms=700, max_speech_ms=10_000, use_silero=True):
         self.buffer: list[np.ndarray] = []
         self.speech_start: float | None = None
         self.last_speech: float = 0.0
         self.energy_threshold = energy_threshold
+        self.speech_threshold = speech_threshold
         self.min_speech_ms = min_speech_ms
         self.min_silence_ms = min_silence_ms
         self.max_speech_ms = max_speech_ms
+        self.use_silero = use_silero
 
     def add(self, chunk: np.ndarray, now: float) -> np.ndarray | None:
-        is_speech = rms(chunk) > self.energy_threshold
+        is_speech = False
+        if self.use_silero:
+            prob = is_speech_silero(chunk)
+            if prob > 0:
+                is_speech = prob >= self.speech_threshold
+            else:
+                is_speech = rms(chunk) > self.energy_threshold
+        else:
+            is_speech = rms(chunk) > self.energy_threshold
+
         if is_speech:
             self.last_speech = now
             if self.speech_start is None:
@@ -111,3 +164,7 @@ class VAD:
         self.buffer.clear()
         self.speech_start = None
         return audio
+
+
+
+
