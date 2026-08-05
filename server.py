@@ -81,6 +81,15 @@ def load_models():
     state["llm_options"] = LLM_MODEL_OPTIONS
     state["redis"] = aioredis.from_url(REDIS_URL, decode_responses=True)
 
+    # Load Piper ONNX model persistently (eliminates ~1.8s subprocess startup per utterance)
+    try:
+        from piper import PiperVoice
+        state["piper_voice"] = PiperVoice.load(f"{PIPER_DATA_DIR}/{PIPER_VOICE}.onnx")
+        log.info("PiperVoice loaded persistently (%s)", PIPER_VOICE)
+    except Exception as e:
+        log.warning("Persistent Piper load failed, falling back to subprocess: %s", e)
+        state["piper_voice"] = None
+
     try:
         from kokoro import KPipeline
         state["kokoro_pipeline"] = KPipeline(lang_code='a', device='cpu')
@@ -119,8 +128,23 @@ def tts_text(text: str) -> str:
 
 # ── Piper TTS streaming ──────────────────────────────────────────────────
 async def tts_stream(text: str):
-    # piper-tts pip package: auto-downloads voice to PIPER_DATA_DIR on first run
     text = tts_text(text)
+    voice = state.get("piper_voice")
+    if voice is not None:
+        # Persistent in-process model — first audio in ~0.1s (vs ~1.8s subprocess)
+        from piper.config import SynthesisConfig
+        cfg = SynthesisConfig(length_scale=PIPER_LENGTH_SCALE)
+        gen = voice.synthesize(text, cfg)
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                chunk = await loop.run_in_executor(None, next, gen)
+            except StopIteration:
+                break
+            yield chunk.audio_int16_bytes
+        return
+
+    # Fallback: subprocess
     proc = await asyncio.create_subprocess_exec(
         "python", "-m", "piper",
         "--model", PIPER_VOICE,

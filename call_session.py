@@ -368,7 +368,6 @@ class CallSession:
         if self.is_call_ended or not self.stream_sid:
             log.warning("[%s] _speak skipped (ended=%s sid=%s): %r", self.call_sid, self.is_call_ended, self.stream_sid, text[:40])
             return
-        self.is_bot_speaking = True
         self.tts_task = asyncio.create_task(self._stream_tts(text))
 
     async def _stream_tts(self, text: str):
@@ -376,6 +375,7 @@ class CallSession:
             log.info("[%s] TTS start: %r", self.call_sid, text[:40])
             frame = bytearray()
             sent_samples = 0
+            audio_started = False
             async for pcm_chunk in self.tts_stream_fn(text):
                 mulaw = piper_to_twilio(
                     np.frombuffer(pcm_chunk, dtype=np.int16), PIPER_RATE
@@ -385,6 +385,11 @@ class CallSession:
                     chunk = bytes(frame[:160])
                     del frame[:160]
                     sent_samples += 160
+                    # Mark as speaking only once audio is actually flowing,
+                    # so a caller's early speech can't barge-in an unheard greeting
+                    if not audio_started:
+                        self.is_bot_speaking = True
+                        audio_started = True
                     await self.ws.send_text(json.dumps({
                         "event": "media",
                         "streamSid": self.stream_sid,
