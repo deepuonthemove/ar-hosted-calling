@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 
 import numpy as np
@@ -21,7 +22,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from audio import VAD, twilio_to_whisper, piper_to_twilio, rms
 from prompts import (
     build_call_prompt, build_greeting, parse_markers,
-    parse_call_result, load_payer, load_denial_codes,
+    parse_call_result, load_payer, load_denial_codes, strip_markers,
 )
 
 log = logging.getLogger("call-session")
@@ -46,6 +47,7 @@ class CallSession:
         self.llm_client = deps["llm_client"]
         self.llm_model = deps["llm_model"]
         self.tts_stream_fn = deps["tts_stream_fn"]
+        self.use_silero = deps.get("use_silero", True)
 
         self.stream_sid: str | None = None
         self.account_uid = ""
@@ -57,7 +59,7 @@ class CallSession:
         self.hold_start: float | None = None
         self.call_result_retries = 0
 
-        self.vad = VAD()
+        self.vad = VAD(use_silero=self.use_silero)
         self.is_bot_speaking = False
         self.is_call_ended = False
         self.last_activity = time.time()
@@ -202,9 +204,22 @@ class CallSession:
             )
             bot_text = ""
             sentence_buffer = ""
+            seen_call_result = False
             async for chunk in stream:
                 token = chunk.choices[0].delta.content or ""
                 bot_text += token
+                # Once the CALL_RESULT marker appears, stop speaking entirely
+                # (JSON can be split across sentence buffers by newlines).
+                if not seen_call_result and re.search(r"CALL_RESULT", bot_text, re.IGNORECASE):
+                    seen_call_result = True
+                    marker_idx = re.search(r"CALL_RESULT", bot_text, re.IGNORECASE).start()
+                    before = bot_text[:marker_idx]
+                    if before.strip():
+                        await self._speak(strip_markers(before))
+                    sentence_buffer = ""
+                    continue
+                if seen_call_result:
+                    continue
                 sentence_buffer += token
                 if token in (".", "!", "?", "\n") and len(sentence_buffer.strip()) > 2:
                     parsed = parse_markers(sentence_buffer)
@@ -212,7 +227,7 @@ class CallSession:
                         await self._speak(parsed["spoken"])
                     sentence_buffer = ""
 
-            if sentence_buffer.strip():
+            if sentence_buffer.strip() and not seen_call_result:
                 parsed_tail = parse_markers(sentence_buffer)
                 if parsed_tail["spoken"]:
                     await self._speak(parsed_tail["spoken"])
@@ -240,6 +255,13 @@ class CallSession:
             # ── End call with [CALL_RESULT] JSON ─────────────────────────
             call_result = parse_call_result(bot_text)
             if call_result:
+                # Say a farewell so the call doesn't end in silence
+                await self._speak("Okay, thank you. Goodbye!")
+                if self.tts_task:
+                    try:
+                        await self.tts_task
+                    except asyncio.CancelledError:
+                        pass
                 await self._finalize("completed", result=call_result)
                 return
 
@@ -253,9 +275,15 @@ class CallSession:
     # ── State Machine ────────────────────────────────────────────────────
     def _advance_state(self, bot_text: str):
         lower = bot_text.lower()
-        if self.state == "IVR_NAV" and ("connected" in lower or "agent" in lower or "representative" in lower):
-            self.state = "CLAIM_VERIFY"
-            log.info("[%s] state: IVR_NAV → CLAIM_VERIFY", self.call_sid)
+        if self.state == "IVR_NAV":
+            if "denied" in lower or "denial" in lower:
+                self.state = "DENIAL_HANDLE"
+            elif "paid" in lower or "approved" in lower:
+                self.state = "APPROVED_HANDLE"
+            elif "connected" in lower or "agent" in lower or "representative" in lower:
+                self.state = "CLAIM_VERIFY"
+            if self.state != "IVR_NAV":
+                log.info("[%s] state: IVR_NAV → %s", self.call_sid, self.state)
         elif self.state == "CLAIM_VERIFY" and any(w in lower for w in ["paid", "denied", "pending", "status"]):
             if "denied" in lower or "denial" in lower:
                 self.state = "DENIAL_HANDLE"
@@ -486,6 +514,30 @@ class CallSession:
             await self.redis.publish("call-updates", json.dumps({
                 "callSid": self.call_sid, **update
             }))
+
+            # Save transcript for the review tab
+            try:
+                real_time = []
+                ai_responses = []
+                for msg in self.conversation:
+                    content = msg.get("content", "")
+                    if msg.get("role") == "user":
+                        cleaned = content.replace("[INSURANCE REP] ", "", 1)
+                        cleaned = re.sub(r"\[STATE: [^\]]*\]\s*", "", cleaned)
+                        real_time.append(cleaned)
+                    elif msg.get("role") == "assistant":
+                        ai_responses.append(content)
+                review = {
+                    "real_time": real_time,
+                    "full_audio": "",
+                    "ai_responses": ai_responses,
+                    "duration_sec": int(duration_ms / 1000),
+                    "audio_size_bytes": 0,
+                    "call_result": result,
+                }
+                await self.redis.set(f"call:{self.call_sid}:review", json.dumps(review))
+            except Exception as e:
+                log.error("[%s] Review save error: %s", self.call_sid, e)
 
             if self.account_uid:
                 today = time.strftime("%m/%d/%Y")

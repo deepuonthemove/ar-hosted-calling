@@ -13,9 +13,11 @@ import io
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 import uuid
+from urllib.parse import urlencode
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -28,7 +30,7 @@ from openpyxl import load_workbook, Workbook
 
 from audio import VAD, twilio_to_whisper, piper_to_twilio, rms
 from call_session import CallSession
-from prompts import build_call_prompt, parse_markers, parse_call_result, build_greeting, load_payer, load_denial_codes, attempt_repair
+from prompts import build_call_prompt, parse_markers, parse_call_result, build_greeting, load_payer, load_denial_codes, attempt_repair, strip_markers, format_dos
 
 # ── Config ───────────────────────────────────────────────────────────────
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "distil-large-v3")
@@ -56,11 +58,14 @@ TTS_ENGINE = os.getenv("TTS_ENGINE", "piper")
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_bella")
 KOKORO_RATE = 24000
 
+VAD_MODE = os.getenv("VAD_MODE", "silero")  # "rms" or "silero"
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ar-voice-agent")
 
 # ── Shared state ─────────────────────────────────────────────────────────
 state: dict = {}
+_bg_tasks: set = set()  # strong refs for background tasks (avoids GC cancellation)
 
 
 def load_models():
@@ -80,12 +85,38 @@ def load_models():
         log.warning("Kokoro not available, will fall back to Piper: %s", e)
         state["kokoro_pipeline"] = None
 
+    # Preload Silero VAD (model downloads on first run)
+    try:
+        from audio import load_silero_vad
+        model, _ = load_silero_vad()
+        state["silero_loaded"] = model is not None
+        log.info("Silero VAD loaded: %s", state["silero_loaded"])
+    except Exception as e:
+        log.warning("Silero VAD preload failed: %s", e)
+        state["silero_loaded"] = False
+
     log.info("Models loaded.")
+
+
+# ── TTS text preprocessing ───────────────────────────────────────────────
+_NUM_ID_RE = re.compile(r"\d{5,}")
+_DATE_RE = re.compile(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?)?)\b")
+
+
+def tts_text(text: str) -> str:
+    """Preprocess text for TTS:
+    - Format dates (02/12/2026 -> 12th February 2026)
+    - Read long digit runs digit-by-digit (claim/account/phone numbers)
+    Short numbers (amounts like 276, years like 2026) keep normal reading.
+    """
+    text = _DATE_RE.sub(lambda m: format_dos(m.group(1)), text)
+    return _NUM_ID_RE.sub(lambda m: " ".join(m.group()), text)
 
 
 # ── Piper TTS streaming ──────────────────────────────────────────────────
 async def tts_stream(text: str):
     # piper-tts pip package: auto-downloads voice to PIPER_DATA_DIR on first run
+    text = tts_text(text)
     proc = await asyncio.create_subprocess_exec(
         "python", "-m", "piper",
         "--model", PIPER_VOICE,
@@ -117,6 +148,7 @@ async def tts_stream(text: str):
 # ── Kokoro TTS streaming ────────────────────────────────────────────────
 async def kokoro_stream(text: str):
     from audio import resample
+    text = tts_text(text)
     pipeline = state.get("kokoro_pipeline")
     if not pipeline:
         log.warning("Kokoro not loaded, falling back to Piper")
@@ -184,11 +216,26 @@ async def transcribe_full_audio(audio_bytes: bytes) -> str:
         return " ".join(s.text for s in segments).strip()
 
 
-async def _save_review(session_id: str, conversation: list[dict], full_audio: bytes, call_duration: float):
+async def _save_review(session_id: str, conversation: list[dict], full_audio: bytes,
+                       call_duration: float, account_uid: str = "", started_at: float = 0.0):
     """Save audio buffer, spawn offline STT, store review data."""
     r = state["redis"]
     audio_key = f"call:{session_id}:audio"
     review_key = f"call:{session_id}:review"
+
+    # Create a call record so browser calls appear in the feed/review list
+    # (don't clobber claim_id/payer/next_action if CALL_RESULT already stored them)
+    existing = await r.hgetall(f"call:{session_id}")
+    await r.hset(f"call:{session_id}", mapping={
+        "claim_id": existing.get("claim_id") or "browser",
+        "payer": existing.get("payer") or "browser",
+        "account_uid": account_uid,
+        "status": "completed",
+        "started_at": str(started_at or time.time()),
+        "ended_at": str(time.time()),
+        "duration_ms": str(int(call_duration * 1000)),
+        "next_action": existing.get("next_action") or "browser test",
+    })
 
     # Save audio to Redis (24h TTL)
     if full_audio:
@@ -226,7 +273,10 @@ async def _save_review(session_id: str, conversation: list[dict], full_audio: by
                       "duration_sec": int(call_duration), "audio_size_bytes": len(full_audio), "error": str(e)}
             await r.set(review_key, json.dumps(review))
 
-    asyncio.create_task(_offline_stt())
+    # Keep a strong reference so the task isn't garbage collected mid-run
+    task = asyncio.create_task(_offline_stt())
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
 
 
 # ── App lifecycle ────────────────────────────────────────────────────────
@@ -243,6 +293,15 @@ app = FastAPI(lifespan=lifespan)
 # ════════════════════════════════════════════════════════════════════════
 # TELEPHONY  (ported from src/index.ts /voice + /media + /make-call)
 # ════════════════════════════════════════════════════════════════════════
+
+def _voice_webhook(payer: str, claim_id: str, account_uid: str, call_sid: str) -> str:
+    """Build the Twilio voice webhook URL with properly URL-encoded params."""
+    params = urlencode({
+        "payer": payer, "claim_id": claim_id,
+        "account_uid": account_uid, "local_sid": call_sid,
+    })
+    return f"{PUBLIC_SCHEME}://{PUBLIC_DOMAIN}/voice?{params}"
+
 
 @app.post("/make-call")
 async def make_call(request: Request):
@@ -269,9 +328,7 @@ async def make_call(request: Request):
     from twilio.base.exceptions import TwilioRestException
     try:
         client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        webhook = (f"{PUBLIC_SCHEME}://{PUBLIC_DOMAIN}/voice"
-                   f"?payer={payer}&claim_id={claim_id}&account_uid={account_uid}"
-                   f"&local_sid={call_sid}")
+        webhook = _voice_webhook(payer, claim_id, account_uid, call_sid)
         call = client.calls.create(to=phone, from_=TWILIO_FROM_NUMBER, url=webhook)
         await state["redis"].rename(f"call:{call_sid}", f"call:{call.sid}")
         return {"ok": True, "callSid": call.sid}
@@ -324,9 +381,7 @@ async def make_call_enriched(request: Request):
     from twilio.base.exceptions import TwilioRestException
     try:
         client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        webhook = (f"{PUBLIC_SCHEME}://{PUBLIC_DOMAIN}/voice"
-                   f"?payer={payer}&claim_id={claim_id}&account_uid={account_uid}"
-                   f"&local_sid={call_sid}")
+        webhook = _voice_webhook(payer, claim_id, account_uid, call_sid)
         call = client.calls.create(to=phone, from_=TWILIO_FROM_NUMBER, url=webhook)
         await r.rename(f"call:{call_sid}", f"call:{call.sid}")
         return {"ok": True, "callSid": call.sid}
@@ -392,6 +447,7 @@ async def media_stream(ws: WebSocket, call_sid: str):
         "llm_client": state["llm_client"],
         "llm_model": state["llm_model"],
         "tts_stream_fn": get_tts_fn(engine),
+        "use_silero": VAD_MODE == "silero",
     })
     await session.run()
 
@@ -429,10 +485,15 @@ async def retry_call(call_sid: str):
 # DATA APIs  (ported: calls list, CSV export, secrets check)
 # ════════════════════════════════════════════════════════════════════════
 
+def _call_record_keys(keys):
+    """Filter Redis keys to actual call record hashes (exclude audio/review strings)."""
+    return [k for k in keys if not k.endswith(":audio") and not k.endswith(":review")]
+
+
 @app.get("/api/calls")
 async def list_calls():
     r = state["redis"]
-    keys = await r.keys("call:*")
+    keys = _call_record_keys(await r.keys("call:*"))
     calls = []
     for key in keys[:50]:
         data = await r.hgetall(key)
@@ -445,7 +506,7 @@ async def list_calls():
 @app.get("/export.csv")
 async def export_csv():
     r = state["redis"]
-    keys = await r.keys("call:*")
+    keys = _call_record_keys(await r.keys("call:*"))
     out = io.StringIO()
     writer = csv.writer(out)
     writer.writerow(["call_sid", "timestamp", "payer", "claim_id", "status",
@@ -720,6 +781,7 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
     # Parse query params from WebSocket URL
     account_uid = ""
     tts_engine = TTS_ENGINE
+    vad_mode = VAD_MODE
     try:
         qs = str(ws.url).split("?")[1] if "?" in str(ws.url) else ""
         for part in qs.split("&"):
@@ -728,10 +790,13 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                 account_uid = v
             elif k == "tts" and v:
                 tts_engine = v
+            elif k == "vad" and v:
+                vad_mode = v
     except Exception:
         pass
 
     tts_fn = get_tts_fn(tts_engine)
+    use_silero = vad_mode == "silero"
 
     account = None
     if account_uid:
@@ -746,8 +811,9 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
     await ws.send_json({"type": "llm_text", "text": greeting})
     tts_task = asyncio.create_task(_stream_tts_reply(ws, greeting, tts_fn))
 
-    vad = VAD()
+    vad = VAD(use_silero=use_silero)
     barge_in = False
+    last_barge_in = 0.0
     full_audio = bytearray()
     call_start = time.time()
     review_saved = False
@@ -767,7 +833,8 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
         if review_saved:
             return
         review_saved = True
-        await _save_review(session_id, conversation, bytes(full_audio), time.time() - call_start)
+        await _save_review(session_id, conversation, bytes(full_audio),
+                           time.time() - call_start, account_uid, call_start)
 
     try:
         while True:
@@ -778,13 +845,17 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             energy = rms(audio)
 
             # If energy spikes while TTS is playing → possible barge-in
-            if tts_task and not tts_task.done() and energy > 0.025:
+            # Cooldown (1.2s) prevents echo from the cancelled TTS re-triggering
+            # a reset that discards the user's ongoing speech.
+            if (tts_task and not tts_task.done() and energy > 0.025
+                    and now - last_barge_in > 1.2):
                 await cancel_tts()
+                last_barge_in = now
                 barge_in = True
                 await ws.send_bytes(b"\x02")
                 # Skip this chunk — it's likely echo from the TTS we just cancelled
                 # Reset VAD to avoid processing leftover echo
-                vad = VAD()
+                vad = VAD(use_silero=use_silero)
                 continue
 
             segment = vad.add(audio, now)
@@ -817,10 +888,27 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                 model=state["llm_model"], messages=conv, max_tokens=150, temperature=0)
             reply = resp.choices[0].message.content.strip()
             conversation.append({"role": "assistant", "content": reply})
-            await ws.send_json({"type": "llm_text", "text": reply})
+
+            # Retain [CALL_RESULT] JSON for downstream processing, don't speak it
+            result = parse_call_result(reply)
+            if result:
+                await state["redis"].hset(f"call:{session_id}", mapping={
+                    "claim_id": result.get("claim_id", "browser"),
+                    "payer": result.get("payer", "browser"),
+                    "status": result.get("status", "completed"),
+                    "next_action": result.get("next_action", ""),
+                    "denial_code": result.get("denial_code", ""),
+                    "paid_amount": str(result.get("paid_amount", "")),
+                    "call_summary": result.get("call_summary", ""),
+                    "call_result": reply,
+                })
+
+            # Strip markers for speech + log display
+            spoken = strip_markers(reply)
+            await ws.send_json({"type": "llm_text", "text": spoken})
 
             # Stream TTS in background so audio reads continue
-            tts_task = asyncio.create_task(_stream_tts_reply(ws, reply, tts_fn))
+            tts_task = asyncio.create_task(_stream_tts_reply(ws, spoken, tts_fn))
 
     except Exception:
         pass
@@ -858,6 +946,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <a href="/export.csv" class="px-3 py-2 bg-gray-700 rounded text-sm font-bold">Export CSV</a>
     </div>
   </div>
+  <div class="flex gap-2 mb-4">
+    <button id="tab-main" onclick="switchTab('main')"
+      class="px-4 py-2 rounded text-sm font-bold bg-blue-600">📊 Dashboard</button>
+    <button id="tab-review" onclick="switchTab('review')"
+      class="px-4 py-2 rounded text-sm font-bold bg-gray-800">🔍 Call Review</button>
+  </div>
+  <div id="view-main">
   <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
     <div class="space-y-6">
       <div class="bg-gray-800 p-6 rounded-lg">
@@ -875,6 +970,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             Place Outbound Call</button>
         </form>
         <div id="msg" class="mt-3 text-xs hidden"></div>
+      </div>
+
+      <!-- VAD Engine Selector -->
+      <div class="bg-gray-800 p-4 rounded-lg">
+        <label class="text-xs text-gray-400 block mb-1">VAD Engine</label>
+        <select id="vad-engine" class="w-full bg-gray-900 border border-gray-700 rounded p-2 text-sm">
+          <option value="silero">Silero (neural)</option>
+          <option value="rms">Plain RMS (energy)</option>
+        </select>
       </div>
 
       <!-- TTS Engine Selector -->
@@ -928,34 +1032,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <h2 class="text-lg font-bold mb-3">Live Call Feed</h2>
         <div id="call-rows" class="space-y-3 max-h-[300px] overflow-y-auto"></div>
       </div>
-
-      <!-- Review Tab -->
-      <div class="bg-gray-800 rounded-lg p-4">
-        <h2 class="text-lg font-bold mb-3">Call Review
-          <span class="text-xs text-gray-400 font-normal">(browser calls only)</span></h2>
-        <div id="review-list" class="space-y-2 max-h-[200px] overflow-y-auto"></div>
-        <div id="review-detail" class="hidden mt-4 border-t border-gray-700 pt-4">
-          <div class="flex justify-between items-center mb-3">
-            <h3 class="text-md font-bold">Transcript Comparison</h3>
-            <button onclick="closeReview()" class="px-2 py-1 bg-gray-700 rounded text-xs">✕ Close</button>
-          </div>
-          <div class="grid grid-cols-2 gap-4">
-            <div class="bg-gray-900 rounded p-3">
-              <div class="text-xs text-blue-300 font-bold mb-2">🔴 Real-Time STT (with VAD)</div>
-              <div id="review-real-time" class="text-xs leading-relaxed whitespace-pre-wrap"></div>
-            </div>
-            <div class="bg-gray-900 rounded p-3">
-              <div class="text-xs text-green-300 font-bold mb-2">🟢 Full Recording STT (no VAD)</div>
-              <div id="review-full-audio" class="text-xs leading-relaxed whitespace-pre-wrap"></div>
-            </div>
-          </div>
-          <div class="mt-3 bg-gray-900 rounded p-3">
-            <div class="text-xs text-orange-300 font-bold mb-2">🤖 AI Responses</div>
-            <div id="review-ai-responses" class="text-xs leading-relaxed whitespace-pre-wrap"></div>
-          </div>
-          <div class="mt-2 text-[10px] text-gray-500" id="review-meta"></div>
-        </div>
-      </div>
     </div>
     <div class="lg:col-span-2 space-y-6">
       <div class="bg-gray-800 p-6 rounded-lg">
@@ -980,7 +1056,43 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <tbody id="acct-rows" class="divide-y divide-gray-700">
               <tr><td colspan="8" class="p-6 text-center text-gray-500">Upload an Excel file.</td></tr>
             </tbody></table></div></div>
-    </div></div></div>
+    </div>
+  </div>
+  </div>
+
+  <!-- Call Review View (separate tab) -->
+  <div id="view-review" class="hidden">
+    <div class="bg-gray-800 rounded-lg p-4">
+      <div class="flex justify-between items-center mb-3">
+        <h2 class="text-lg font-bold">Call Review
+          <span class="text-xs text-gray-400 font-normal">(browser calls only)</span></h2>
+        <button onclick="switchTab('main')" class="px-3 py-1 bg-gray-700 rounded text-xs">← Back to Dashboard</button>
+      </div>
+      <div id="review-list" class="space-y-2 max-h-[400px] overflow-y-auto"></div>
+      <div id="review-detail" class="hidden mt-4 border-t border-gray-700 pt-4">
+        <div class="flex justify-between items-center mb-3">
+          <h3 class="text-md font-bold">Transcript Comparison</h3>
+          <button onclick="closeReview()" class="px-2 py-1 bg-gray-700 rounded text-xs">✕ Close</button>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="bg-gray-900 rounded p-3">
+            <div class="text-xs text-blue-300 font-bold mb-2">🔴 Real-Time STT (with VAD)</div>
+            <div id="review-real-time" class="text-xs leading-relaxed whitespace-pre-wrap"></div>
+          </div>
+          <div class="bg-gray-900 rounded p-3">
+            <div class="text-xs text-green-300 font-bold mb-2">🟢 Full Recording STT (no VAD)</div>
+            <div id="review-full-audio" class="text-xs leading-relaxed whitespace-pre-wrap"></div>
+          </div>
+        </div>
+        <div class="mt-3 bg-gray-900 rounded p-3">
+          <div class="text-xs text-orange-300 font-bold mb-2">🤖 AI Responses</div>
+          <div id="review-ai-responses" class="text-xs leading-relaxed whitespace-pre-wrap"></div>
+        </div>
+        <div class="mt-2 text-[10px] text-gray-500" id="review-meta"></div>
+      </div>
+    </div>
+  </div>
+</div>
 <script>
 const $ = id => document.getElementById(id);
 let stats = {total: 0, success: 0};
@@ -1100,9 +1212,11 @@ async function startBrowserCall() {
   const sid = 'browser_' + Math.random().toString(36).slice(2);
   const uid = ($('account_uid') && $('account_uid').value) || '';
   const tts = ($('tts-engine') && $('tts-engine').value) || 'piper';
+  const vad = ($('vad-engine') && $('vad-engine').value) || 'silero';
   const params = new URLSearchParams();
   if (uid) params.set('account_uid', uid);
   params.set('tts', tts);
+  params.set('vad', vad);
   bcPlayCtx = new AudioContext(); // create inside user gesture — ensures running state
   bcWS = new WebSocket('wss://' + location.host + '/ws/' + sid + '?' + params.toString());
   bcWS.binaryType = 'arraybuffer';
@@ -1114,7 +1228,7 @@ async function startBrowserCall() {
   $('browser-call-btn').className = 'w-full bg-red-700 hover:bg-red-600 font-bold p-3 rounded text-sm';
 
   bcWS.onopen = async () => {
-    bcLogEl.innerHTML = '<div class="text-green-400">Connected — starting mic...</div>';
+    bcLog('Connected — starting mic...', 'text-green-400');
     try {
       bcCtx = new AudioContext({ sampleRate: 16000 });
       bcMic = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -1129,9 +1243,9 @@ async function startBrowserCall() {
       };
       bcSrc.connect(bcProc);
       bcProc.connect(bcCtx.destination);
-      bcLogEl.innerHTML = '<div class="text-green-400">✅ Mic active — speak now</div>';
+      bcLog('✅ Mic active — speak now', 'text-green-400');
     } catch (e) {
-      bcLogEl.innerHTML = '<div class="text-red-400">❌ Mic error: ' + e.message + '</div>';
+      bcLog('❌ Mic error: ' + e.message, 'text-red-400');
     }
   };
 
@@ -1202,9 +1316,18 @@ async function switchLLM() {
 loadLLM();
 
 // ── Review Tab ──────────────────────────────────────────────────────
+function switchTab(name) {
+  const main = name === 'main';
+  $('view-main').classList.toggle('hidden', !main);
+  $('view-review').classList.toggle('hidden', main);
+  $('tab-main').className = 'px-4 py-2 rounded text-sm font-bold ' + (main ? 'bg-blue-600' : 'bg-gray-800');
+  $('tab-review').className = 'px-4 py-2 rounded text-sm font-bold ' + (main ? 'bg-gray-800' : 'bg-blue-600');
+  if (!main) fetchReviews();
+}
+
 function highlightDiff(realText, fullText) {
-  const realWords = (realText || '').split(/\s+/).filter(Boolean);
-  const fullWords = (fullText || '').split(/\s+/).filter(Boolean);
+  const realWords = (realText || '').split(/\\s+/).filter(Boolean);
+  const fullWords = (fullText || '').split(/\\s+/).filter(Boolean);
   const fullSet = new Set(fullWords.map(w => w.toLowerCase()));
   const realSet = new Set(realWords.map(w => w.toLowerCase()));
   const missed = realWords.filter(w => !fullSet.has(w.toLowerCase()));
@@ -1222,15 +1345,15 @@ function highlightDiff(realText, fullText) {
 async function fetchReviews() {
   try {
     const calls = await (await fetch('/api/calls')).json();
-    const browserCalls = calls.filter(c => c.callSid && c.callSid.startsWith('browser_'));
+    const callable = calls.filter(c => c.callSid && (c.callSid.startsWith('browser_') || c.callSid.startsWith('CA')));
     const list = $('review-list');
-    if (!browserCalls.length) {
-      list.innerHTML = '<div class="text-gray-500 text-xs">No browser calls yet</div>';
+    if (!callable.length) {
+      list.innerHTML = '<div class="text-gray-500 text-xs">No calls yet</div>';
       return;
     }
-    list.innerHTML = browserCalls.slice(0, 10).map(c =>
+    list.innerHTML = callable.slice(0, 10).map(c =>
       `<div class="flex justify-between items-center bg-gray-900 rounded p-2 text-xs">
-        <span class="text-gray-400">${c.callSid.slice(0, 20)}…</span>
+        <span class="text-gray-400">${c.callSid.slice(0, 24)}…</span>
         <span class="${c.status==='completed'?'text-green-400':'text-yellow-400'}">${c.status}</span>
         <button onclick="openReview('${c.callSid}')"
           class="px-2 py-0.5 bg-blue-700 hover:bg-blue-600 rounded text-[10px]">Review</button>
@@ -1252,7 +1375,15 @@ async function openReview(sid) {
   rMeta.textContent = '';
   try {
     const d = await (await fetch(`/api/calls/${sid}/review`)).json();
-    if (d.error) { rTime.textContent = 'Review not available'; return; }
+    if (d.error) {
+      if (sid.startsWith('browser_')) {
+        rTime.textContent = '⏳ Offline transcription in progress — refresh in a few seconds.';
+        setTimeout(() => openReview(sid), 5000);
+      } else {
+        rTime.textContent = 'No transcript available for this call.';
+      }
+      return;
+    }
 
     const userText = (d.real_time || []).join('\\n');
     const fullText = d.full_audio || '';
@@ -1264,7 +1395,7 @@ async function openReview(sid) {
 
     const dur = d.duration_sec ? Math.round(d.duration_sec / 60 * 10) / 10 + 'm' : '?';
     const size = d.audio_size_bytes ? (d.audio_size_bytes / 1024 / 1024).toFixed(1) + 'MB' : '?';
-    const words = fullText ? fullText.split(/\s+/).length : 0;
+    const words = fullText ? fullText.split(/\\s+/).length : 0;
     rMeta.textContent = `Duration: ${dur} · Audio: ${size} · Words: ${words} · ` +
       `Missed: ${diff.missed} · Extra: ${diff.extra}`;
   } catch (e) { rTime.textContent = 'Error loading review'; }

@@ -119,8 +119,6 @@ services:
       - caddy-data:/data
     environment:
       - PUBLIC_DOMAIN=${PUBLIC_DOMAIN:-}
-    depends_on:
-      - voice-agent
     profiles: [tls]
 
 volumes:

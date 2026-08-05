@@ -71,7 +71,18 @@ def piper_to_twilio(pcm_int16: np.ndarray, piper_rate: int) -> bytes:
 
 # ── VAD (Silero VAD with RMS Energy Fallback) ──────────────────────────
 _silero_model = None
-_silero_utils = None
+_silero_utils: dict = {}
+
+
+def _find_vad_iterator(utils) -> type | None:
+    """Silero returns utils as a dict (older) or tuple (newer). Find VADIterator class."""
+    if isinstance(utils, dict):
+        return utils.get("VADIterator")
+    if isinstance(utils, (tuple, list)):
+        for u in utils:
+            if isinstance(u, type) and u.__name__ == "VADIterator":
+                return u
+    return None
 
 
 def load_silero_vad():
@@ -88,11 +99,11 @@ def load_silero_vad():
             onnx=False
         )
         _silero_model = model
-        _silero_utils = utils
+        _silero_utils = {"VADIterator": _find_vad_iterator(utils)}
         return _silero_model, _silero_utils
     except Exception as e:
         print(f"[VAD] Silero VAD load failed ({e}); falling back to RMS energy VAD")
-        return None, None
+        return None, {}
 
 
 def is_speech_silero(chunk: np.ndarray, sample_rate: int = 16000) -> float:
@@ -118,8 +129,14 @@ def rms(audio: np.ndarray) -> float:
 
 class VAD:
     """Accumulates speech; returns segment when silence ends utterance.
-    Uses Silero VAD if available, falling back to RMS energy thresholding.
+
+    When `use_silero` is True and the Silero model is available, uses Silero's
+    VADIterator (frame-based, 512-sample frames) for reliable speech boundaries.
+    Otherwise falls back to RMS energy thresholding.
     """
+
+    FRAME = 512
+    PREROLL_FRAMES = 8  # ~256ms of pre-roll before speech onset
 
     def __init__(self, energy_threshold=0.015, speech_threshold=0.5,
                  min_speech_ms=400, min_silence_ms=700, max_speech_ms=10_000, use_silero=True):
@@ -133,17 +150,51 @@ class VAD:
         self.max_speech_ms = max_speech_ms
         self.use_silero = use_silero
 
-    def add(self, chunk: np.ndarray, now: float) -> np.ndarray | None:
-        is_speech = False
-        if self.use_silero:
-            prob = is_speech_silero(chunk)
-            if prob > 0:
-                is_speech = prob >= self.speech_threshold
-            else:
-                is_speech = rms(chunk) > self.energy_threshold
-        else:
-            is_speech = rms(chunk) > self.energy_threshold
+        # Silero frame-based machinery
+        self._silero = None
+        self._torch = None
+        self._pending = None
+        self._ring = None
+        self._segment = None
+        self._speech_start_s = None
+        if use_silero:
+            self._init_silero()
 
+    def _init_silero(self):
+        try:
+            import torch
+            model, utils = load_silero_vad()
+            if model is None:
+                self._silero = None
+                return
+            self._torch = torch
+            # min_silence must match RMS path (default 100ms fires 'end' mid-thought)
+            self._silero = utils["VADIterator"](
+                model, sampling_rate=16000, min_silence_duration_ms=self.min_silence_ms
+            )
+            self._pending = np.array([], dtype=np.float32)
+            self._ring = np.array([], dtype=np.float32)
+            self._segment = np.array([], dtype=np.float32)
+            self._speech_start_s = None
+        except Exception:
+            self._silero = None
+
+    def reset_silero(self):
+        if self._silero is None:
+            return
+        self._pending = np.array([], dtype=np.float32)
+        self._ring = np.array([], dtype=np.float32)
+        self._segment = np.array([], dtype=np.float32)
+        self._speech_start_s = None
+        self._silero.reset_states()
+
+    def add(self, chunk: np.ndarray, now: float) -> np.ndarray | None:
+        if self._silero is not None:
+            return self._add_silero(chunk, now)
+        return self._add_rms(chunk, now)
+
+    def _add_rms(self, chunk: np.ndarray, now: float) -> np.ndarray | None:
+        is_speech = rms(chunk) > self.energy_threshold
         if is_speech:
             self.last_speech = now
             if self.speech_start is None:
@@ -158,6 +209,37 @@ class VAD:
         if dur_ms > self.max_speech_ms:
             return self._flush()
         return None
+
+    def _add_silero(self, chunk: np.ndarray, now: float) -> np.ndarray | None:
+        self._pending = np.concatenate([self._pending, chunk.astype(np.float32)])
+        result = None
+        while len(self._pending) >= self.FRAME:
+            frame = self._pending[:self.FRAME]
+            self._pending = self._pending[self.FRAME:]
+
+            # Rolling pre-roll buffer (kept only during speech gaps, used on onset)
+            self._ring = np.concatenate([self._ring, frame])
+            max_ring = self.PREROLL_FRAMES * self.FRAME
+            if len(self._ring) > max_ring:
+                self._ring = self._ring[-max_ring:]
+
+            event = self._silero(self._torch.from_numpy(frame).unsqueeze(0))
+            if isinstance(event, dict) and "start" in event:
+                self._speech_start_s = now
+                self._segment = self._ring.copy()
+            elif self._speech_start_s is not None:
+                self._segment = np.concatenate([self._segment, frame])
+
+            if isinstance(event, dict) and "end" in event:
+                if self._speech_start_s is not None and (now - self._speech_start_s) * 1000 >= self.min_speech_ms:
+                    result = self._segment
+                self._speech_start_s = None
+                self._segment = np.array([], dtype=np.float32)
+            elif self._speech_start_s is not None and (now - self._speech_start_s) * 1000 > self.max_speech_ms:
+                result = self._segment
+                self._speech_start_s = None
+                self._segment = np.array([], dtype=np.float32)
+        return result
 
     def _flush(self) -> np.ndarray:
         audio = np.concatenate(self.buffer) if self.buffer else np.array([], dtype=np.float32)

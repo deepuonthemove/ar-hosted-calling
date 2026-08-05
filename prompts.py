@@ -1,9 +1,49 @@
 """Prompt builders, marker parsing, and [CALL_RESULT] JSON parser.
 Ported from src/do.ts — extended with state machine, JSON result, and knowledge base injection.
 """
+import datetime
 import json
 import re
 from pathlib import Path
+
+
+def _ordinal_day(day: int) -> str:
+    if 10 <= day % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
+def format_dos(dos) -> str:
+    """Format a Date of Service value for natural speech, e.g. '4th February 2026'.
+
+    Handles ISO datetimes, date-only strings, and Excel serial numbers.
+    Falls back to the raw value if it cannot be parsed.
+    """
+    if dos is None:
+        return "unknown"
+    s = str(dos).strip()
+    if not s:
+        return "unknown"
+
+    # Excel serial number (days since 1899-12-30)
+    if s.replace("-", "").replace("+", "").isdigit() and len(s) <= 6:
+        try:
+            dt = datetime.datetime(1899, 12, 30) + datetime.timedelta(days=int(s))
+            return f"{_ordinal_day(dt.day)} {dt.strftime('%B')} {dt.year}"
+        except Exception:
+            pass
+
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M",
+                "%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%b %d, %Y", "%B %d, %Y",
+                "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            dt = datetime.datetime.strptime(s, fmt)
+            return f"{_ordinal_day(dt.day)} {dt.strftime('%B')} {dt.year}"
+        except ValueError:
+            continue
+    return s
 
 # ── Browser Test Prompt (no IVR/DTMF markers) ────────────────────────────
 BROWSER_PROMPT = """You are a helpful voice assistant responding to short voice queries.
@@ -29,7 +69,20 @@ Follow these rules strictly:
 7. NEVER tell the representative to "contact support", "check back later", "wait for updates", or offer to set reminders — you are the one handling this claim
 8. NEVER offer advice or assistance to the representative
 9. Respond concisely in 1-2 sentences. Be direct and professional.
-10. When you have all needed information, output [CALL_RESULT] followed by a JSON object."""
+10. Keep the conversation going — ask follow-up questions until you have the complete, confirmed claim picture.
+11. ONLY at the very end of the call, after you have confirmed the final status and all details with the representative, output [CALL_RESULT] followed by a JSON object with EXACTLY these keys:
+{
+  "status": "paid or denied or pending",
+  "payer": "payer name",
+  "claim_id": "claim number",
+  "next_action": "the concrete next step",
+  "denial_code": "e.g. CO-11",
+  "denial_description": "short reason",
+  "paid_amount": 0,
+  "appeal_deadline": "date or null",
+  "call_summary": "one line summary"
+}
+Use the exact key names shown above — especially "status" (not claim_status), "claim_id" (not claimId), "next_action" (not appeal_process). Never output [CALL_RESULT] after only one or two exchanges. Never fabricate the status, codes, amounts, or dates — if you don't have a confirmed answer, ask for it instead of ending the call."""
 
 
 # ── Call Flow States ────────────────────────────────────────────────────
@@ -137,7 +190,7 @@ def build_call_prompt(state: str, payer_knowledge: dict | None,
         parts.append(
             f"[CLAIM CONTEXT]\n"
             f"Patient: {account.get('Patient Name', account.get('patientName', 'unknown'))}\n"
-            f"DOS: {account.get('DOS', account.get('dos', 'unknown'))}\n"
+            f"Date of Service: {format_dos(account.get('DOS', account.get('dos')))}\n"
             f"CPT: {account.get('CPT', account.get('cpt', 'unknown'))}\n"
             f"Billed: ${account.get('Billed Amount', account.get('billedAmount', '0'))}\n"
             f"Payer: {account.get('Responsible Payer', account.get('provider', 'unknown'))}\n"
@@ -164,26 +217,29 @@ def build_call_prompt(state: str, payer_knowledge: dict | None,
         for key, nodes in tree.items():
             for node in nodes:
                 verify = node.get("verify_phrase", "")
-                dtmf_info = (
-                    f"DTMF={node['dtmf']}"
-                    if node.get("dtmf_mode") == "numpad"
-                    else f"DTMF={node.get('dtmf', '?')}"
-                )
+                dtmf_info = f"DTMF={node.get('dtmf', '?')}"
                 parts.append(f"  {node['prompt_phrase']} → {dtmf_info}, verify='{verify}'")
 
+    # Universal HIPAA 835 denial codes — always injected (all payers)
+    codes = load_denial_codes()
+    ctxs = load_denial_context()
+    lines = []
+    for code in sorted(codes):
+        desc = codes[code]
+        ctx = ctxs.get(code.upper(), {})
+        line = f"  {code}: {desc}"
+        if ctx.get("script_guideline"):
+            line += f" | Script Advice: {ctx['script_guideline']}"
+        lines.append(line)
+    parts.append("[DENIAL CODES KNOWLEDGE BASE]")
+    parts.append("\n".join(lines))
+
+    # Payer-specific likely codes (hint only, not exhaustive)
     if denial_code_subset:
-        codes = load_denial_codes()
-        ctxs = load_denial_context()
-        parts.append("[DENIAL CODES KNOWLEDGE BASE]")
-        for code in denial_code_subset:
-            desc = codes.get(code, "")
-            ctx = ctxs.get(code.upper(), {})
-            guideline = ctx.get("script_guideline", "")
-            if desc or guideline:
-                line = f"  {code}: {desc}"
-                if guideline:
-                    line += f" | Script Advice: {guideline}"
-                parts.append(line)
+        present = [c for c in denial_code_subset if c in codes]
+        if present:
+            parts.append("[LIKELY DENIAL CODES FOR THIS PAYER]")
+            parts.append("  " + ", ".join(present))
 
     return "\n\n".join(parts)
 
@@ -194,7 +250,7 @@ def build_greeting(account: dict | None) -> str:
     return (
         f"Hello, this is an AR specialist calling regarding claim "
         f"for patient {account.get('Patient Name', 'unknown')}, "
-        f"Date of Service {account.get('DOS', 'unknown')}, "
+        f"Date of Service {format_dos(account.get('DOS'))}, "
         f"billed amount ${account.get('Billed Amount', 'unknown')}, "
         f"with payer reference {account.get('Account Number', 'unknown')}. "
         f"I need to check the status of this claim."
@@ -221,13 +277,14 @@ def parse_markers(bot_text: str) -> dict:
 def strip_markers(text: str) -> str:
     text = DTMF_RE.sub("", text)
     text = WAITING_RE.sub("", text)
-    text = re.sub(r'\[CALL_RESULT\].*', '', text, flags=re.DOTALL)
+    # LLM may emit [CALL_RESULT], CALL_RESULT:, or CALL_RESULT — strip any and the JSON after it
+    text = re.sub(r'\[?CALL_RESULT\]?\s*:?\s*\{.*', '', text, flags=re.DOTALL)
     text = text.replace("[", "").replace("]", "")
     return text.strip()
 
 
 # ── [CALL_RESULT] JSON Parser ───────────────────────────────────────────
-CALL_RESULT_RE = re.compile(r'\[CALL_RESULT\]\s*(\{.*?\})(?:\s*\[|\s*$)', re.DOTALL)
+CALL_RESULT_RE = re.compile(r'\[?CALL_RESULT\]?\s*:?\s*(\{.*?\})(?:\s*\[|\s*$)', re.DOTALL)
 
 CALL_RESULT_SCHEMA = {
     "status": str,
@@ -258,11 +315,19 @@ def parse_call_result(text: str) -> dict | None:
         result = json.loads(raw)
     except json.JSONDecodeError:
         return None
-    for field, field_type in CALL_RESULT_SCHEMA.items():
-        if field not in result:
-            return None
-        if not isinstance(result[field], field_type):
-            return None
+
+    # Accept alternate key names the LLM tends to emit
+    if "status" not in result and "claim_status" in result:
+        result["status"] = result["claim_status"]
+    if "claim_id" not in result and "claimId" in result:
+        result["claim_id"] = result["claimId"]
+    if "next_action" not in result and "appeal_process" in result:
+        result["next_action"] = result["appeal_process"]
+
+    # Only `status` is strictly required; payer/claim_id/next_action fall back
+    # to the call record in _finalize when missing.
+    if "status" not in result or not isinstance(result["status"], str):
+        return None
     return result
 
 
