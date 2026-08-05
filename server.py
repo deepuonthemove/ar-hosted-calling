@@ -53,10 +53,14 @@ PUBLIC_SCHEME = os.getenv("PUBLIC_SCHEME", "https")
 PIPER_VOICE = os.getenv("PIPER_VOICE", "en_US-lessac-medium")
 PIPER_RATE = int(os.getenv("PIPER_SAMPLE_RATE", "22050"))
 PIPER_DATA_DIR = os.getenv("PIPER_DATA_DIR", "/models/piper")
+# >1.0 = slower (length-scale), 1.0 = normal
+PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.12"))
 
 TTS_ENGINE = os.getenv("TTS_ENGINE", "piper")
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_bella")
 KOKORO_RATE = 24000
+# <1.0 = slower (speed), 1.0 = normal
+KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "0.9"))
 
 VAD_MODE = os.getenv("VAD_MODE", "silero")  # "rms" or "silero"
 
@@ -122,6 +126,7 @@ async def tts_stream(text: str):
         "--model", PIPER_VOICE,
         "--data-dir", PIPER_DATA_DIR,
         "--output-raw",
+        "--length-scale", str(PIPER_LENGTH_SCALE),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
@@ -158,7 +163,7 @@ async def kokoro_stream(text: str):
     loop = asyncio.get_running_loop()
     try:
         results = await loop.run_in_executor(
-            None, lambda: list(pipeline(text, voice=KOKORO_VOICE))
+            None, lambda: list(pipeline(text, voice=KOKORO_VOICE, speed=KOKORO_SPEED))
         )
     except Exception as e:
         log.error("Kokoro TTS error: %s", e)
@@ -883,7 +888,7 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
 
             conversation.append({"role": "user", "content": f"[INSURANCE REP] {text}"})
             await ws.send_json({"type": "transcript", "text": text})
-            conv = conversation if len(conversation) <= 7 else [conversation[0]] + conversation[-6:]
+            conv = conversation if len(conversation) <= 15 else [conversation[0]] + conversation[-14:]
             resp = await state["llm_client"].chat.completions.create(
                 model=state["llm_model"], messages=conv, max_tokens=150, temperature=0)
             reply = resp.choices[0].message.content.strip()
@@ -902,6 +907,25 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                     "call_summary": result.get("call_summary", ""),
                     "call_result": reply,
                 })
+
+            # If CALL_RESULT was emitted, say a farewell and end the call
+            # (otherwise it would go silent and the agent would repeat itself)
+            if result or re.search(r"CALL_RESULT", reply, re.IGNORECASE):
+                await cancel_tts()
+                farewell = "Okay, thank you. Goodbye!"
+                await ws.send_json({"type": "llm_text", "text": farewell})
+                tts_task = asyncio.create_task(_stream_tts_reply(ws, farewell, tts_fn))
+                if tts_task:
+                    try:
+                        await tts_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                await _finalize_review()
+                await asyncio.sleep(1)
+                await ws.close()
+                return
 
             # Strip markers for speech + log display
             spoken = strip_markers(reply)

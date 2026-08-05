@@ -68,6 +68,7 @@ class CallSession:
         self.system_prompt = build_call_prompt("GREETING", None, None, None)
         self.tts_task: asyncio.Task | None = None
         self.watchdog_task: asyncio.Task | None = None
+        self.last_tts_duration: float = 0.0
 
     # ── Entry ────────────────────────────────────────────────────────────
     async def run(self):
@@ -253,15 +254,26 @@ class CallSession:
                     self.hold_start = time.time()
 
             # ── End call with [CALL_RESULT] JSON ─────────────────────────
+            # The marker itself is the end-of-call signal — finalize even if
+            # the JSON is missing/malformed (repair is attempted in _finalize).
             call_result = parse_call_result(bot_text)
-            if call_result:
+            if call_result or re.search(r"CALL_RESULT", bot_text, re.IGNORECASE):
+                if not call_result:
+                    log.info("[%s] CALL_RESULT marker without valid JSON — ending call", self.call_sid)
                 # Say a farewell so the call doesn't end in silence
+                log.info("[%s] Speaking farewell (ended=%s sid=%s)", self.call_sid, self.is_call_ended, self.stream_sid)
                 await self._speak("Okay, thank you. Goodbye!")
                 if self.tts_task:
                     try:
                         await self.tts_task
+                        log.info("[%s] Farewell TTS completed", self.call_sid)
                     except asyncio.CancelledError:
-                        pass
+                        log.warning("[%s] Farewell TTS cancelled", self.call_sid)
+                    except Exception as e:
+                        log.warning("[%s] Farewell TTS error: %s", self.call_sid, e)
+                # Give Twilio time to flush/play the farewell audio before closing.
+                # Wait the full audio duration + a margin for Twilio's playback buffer.
+                await asyncio.sleep(max(1.5, self.last_tts_duration + 1.0))
                 await self._finalize("completed", result=call_result)
                 return
 
@@ -351,14 +363,19 @@ class CallSession:
 
     # ── TTS → Twilio ────────────────────────────────────────────────────
     async def _speak(self, text: str):
+        if not text or not text.strip():
+            return
         if self.is_call_ended or not self.stream_sid:
+            log.warning("[%s] _speak skipped (ended=%s sid=%s): %r", self.call_sid, self.is_call_ended, self.stream_sid, text[:40])
             return
         self.is_bot_speaking = True
         self.tts_task = asyncio.create_task(self._stream_tts(text))
 
     async def _stream_tts(self, text: str):
         try:
+            log.info("[%s] TTS start: %r", self.call_sid, text[:40])
             frame = bytearray()
+            sent_samples = 0
             async for pcm_chunk in self.tts_stream_fn(text):
                 mulaw = piper_to_twilio(
                     np.frombuffer(pcm_chunk, dtype=np.int16), PIPER_RATE
@@ -367,6 +384,7 @@ class CallSession:
                 while len(frame) >= 160:
                     chunk = bytes(frame[:160])
                     del frame[:160]
+                    sent_samples += 160
                     await self.ws.send_text(json.dumps({
                         "event": "media",
                         "streamSid": self.stream_sid,
@@ -378,8 +396,13 @@ class CallSession:
                     "streamSid": self.stream_sid,
                     "media": {"payload": base64.b64encode(bytes(frame)).decode()},
                 }))
+                sent_samples += len(frame)
+            # μ-law is 8kHz: 8000 samples = 1 second of audio
+            self.last_tts_duration = sent_samples / 8000.0
             self.is_bot_speaking = False
+            log.info("[%s] TTS done (%.2fs audio)", self.call_sid, self.last_tts_duration)
         except asyncio.CancelledError:
+            log.warning("[%s] TTS cancelled", self.call_sid)
             pass
         except Exception as e:
             log.warning("[%s] TTS error: %s", self.call_sid, e)
