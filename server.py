@@ -659,6 +659,49 @@ async def _resolve_account(project_id: str, row_num: int) -> tuple[str | None, d
     return uid, acct
 
 
+async def _effective_prompt(account: dict | None) -> str:
+    """System prompt for an account: custom override if set, else the built default.
+    Notes are appended in either case."""
+    if not account:
+        return build_call_prompt("GREETING", None, None, None)
+    uid = account.get("UID", "")
+    custom = None
+    if uid:
+        custom = await state["redis"].get(f"account:{uid}:llm_context")
+    notes = account.get("Notes", "")
+    if custom:
+        prompt = custom
+        if notes:
+            prompt += f"\n\n[PRIOR CALL NOTES]\n{notes}"
+        return prompt
+    return build_call_prompt("GREETING", None, None, account)
+
+
+@app.get("/api/accounts/{account_uid}/llm-context")
+async def get_llm_context(account_uid: str):
+    account = await state["redis"].hgetall(f"account:{account_uid}") or None
+    custom = await state["redis"].get(f"account:{account_uid}:llm_context") or ""
+    original = build_call_prompt("GREETING", None, None, account)
+    effective = await _effective_prompt(account)
+    return {"account_uid": account_uid, "custom": custom, "original": original, "effective": effective}
+
+
+@app.post("/api/accounts/{account_uid}/llm-context")
+async def update_llm_context(account_uid: str, request: Request):
+    data = await request.json()
+    key = f"account:{account_uid}:llm_context"
+    if data.get("reset"):
+        await state["redis"].delete(key)
+    else:
+        ctx = (data.get("context") or "").strip()
+        if not ctx:
+            return JSONResponse({"error": "context is required"}, 400)
+        await state["redis"].set(key, ctx)
+    account = await state["redis"].hgetall(f"account:{account_uid}") or None
+    return {"ok": True, "custom": (await state["redis"].get(key)) or "",
+            "effective": await _effective_prompt(account)}
+
+
 @app.post("/api/upload-excel")
 async def upload_excel(file: UploadFile = File(...)):
     try:
@@ -760,6 +803,172 @@ async def add_note(request: Request):
     merged = (prior + "\n" if prior else "") + f"[{now}] {note}"
     await state["redis"].hset(f"account:{uid}", mapping={"Notes": merged})
     return {"ok": True, "account_uid": uid, "notes": merged}
+
+
+async def _archive_chat(account_uid: str) -> tuple[str | None, dict | None]:
+    """Archive the active chat into an ended session (with config + timing)."""
+    chat_key = f"chat:{account_uid}:active"
+    raw = await state["redis"].lrange(chat_key, 0, -1)
+    if not raw:
+        return None, None
+    turns = [json.loads(x) for x in raw]
+    m = await state["redis"].hgetall(f"chat:{account_uid}:active:meta")
+    sid = f"chat-{uuid.uuid4().hex[:12]}"
+    turns_key = f"chat:{account_uid}:session:{sid}"
+    for t in turns:
+        await state["redis"].rpush(turns_key, json.dumps(t))
+
+    llm_count = int(m.get("llm_count", 0))
+    llm_avg = int(float(m.get("llm_total_ms", 0)) / max(1, llm_count))
+    meta = {
+        "account_uid": account_uid,
+        "started_at": turns[0].get("ts", time.time()),
+        "ended_at": time.time(),
+        "count": len(turns),
+        "preview": (turns[0].get("text") or "")[:120],
+        "llm_model": m.get("llm_model", ""),
+        "prompt": m.get("prompt", ""),
+        "llm_avg_ms": llm_avg,
+        "llm_count": llm_count,
+    }
+    await state["redis"].set(f"chat:session:{sid}", json.dumps(meta))
+    await state["redis"].rpush(f"chat:{account_uid}:history", sid)
+    await state["redis"].delete(chat_key)
+    await state["redis"].delete(f"chat:{account_uid}:active:meta")
+    return sid, meta
+
+
+# ── Direct chat with the LLM (bypasses STT/TTS, isolated from calls/review) ─
+@app.post("/api/chat")
+async def chat_with_llm(request: Request):
+    data = await request.json()
+    message = (data.get("message") or "").strip()
+    if not message:
+        return JSONResponse({"error": "message required"}, 400)
+
+    account_uid = data.get("account_uid", "")
+    if not account_uid and data.get("project_id") and data.get("row_num"):
+        account_uid, _ = await _resolve_account(data["project_id"], int(data["row_num"]))
+    if not account_uid:
+        return JSONResponse({"error": "account_uid or project_id+row_num required"}, 400)
+
+    account = await state["redis"].hgetall(f"account:{account_uid}") or None
+    system_prompt = await _effective_prompt(account)
+    chat_key = f"chat:{account_uid}:active"
+    meta_key = f"chat:{account_uid}:active:meta"
+
+    raw = await state["redis"].lrange(chat_key, 0, -1)
+    history = [json.loads(x) for x in raw] if raw else []
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for t in history[-16:]:
+        messages.append({"role": t["role"], "content": t["text"]})
+    messages.append({"role": "user", "content": message})
+
+    llm_t0 = time.time()
+    try:
+        resp = await state["llm_client"].chat.completions.create(
+            model=state["llm_model"], messages=messages, max_tokens=300, temperature=0)
+        reply_raw = resp.choices[0].message.content.strip()
+    except Exception as e:
+        return JSONResponse({"error": f"LLM error: {e}"}, 500)
+    llm_ms = (time.time() - llm_t0) * 1000
+
+    # Track chat timing/config in the ACTIVE meta (never touches call records)
+    await state["redis"].hincrbyfloat(meta_key, "llm_total_ms", llm_ms)
+    await state["redis"].hincrby(meta_key, "llm_count", 1)
+    await state["redis"].hset(meta_key, mapping={
+        "llm_model": state["llm_model"], "prompt": system_prompt, "account_uid": account_uid,
+    })
+
+    reply = strip_markers(reply_raw)
+
+    # Detect end-of-chat: CALL_RESULT marker, empty reply, or a farewell phrase
+    has_call_result = bool(re.search(r"CALL_RESULT", reply_raw, re.IGNORECASE))
+    is_empty = not reply.strip()
+    is_farewell = any(p in reply.lower() for p in
+                      ["goodbye", "good bye", "ending the chat", "end the chat",
+                       "that concludes", "no further questions", "have a great day"])
+    should_end = has_call_result or is_empty or is_farewell
+
+    now = time.time()
+    await state["redis"].rpush(chat_key, json.dumps({"role": "user", "text": message, "ts": now}))
+    if reply:
+        await state["redis"].rpush(chat_key, json.dumps({"role": "assistant", "text": reply, "ts": now}))
+    if len(history) > 200:
+        await state["redis"].ltrim(chat_key, -200, -1)
+
+    # Auto-archive to history when the AI ends the chat
+    if should_end:
+        sid, meta = await _archive_chat(account_uid)
+        return {"ok": True, "reply": reply, "ended": True, "session_id": sid}
+
+    return {"ok": True, "reply": reply, "ended": False}
+
+
+@app.get("/api/chat/{account_uid}")
+async def get_chat(account_uid: str):
+    raw = await state["redis"].lrange(f"chat:{account_uid}:active", 0, -1)
+    return [json.loads(x) for x in raw] if raw else []
+
+
+@app.post("/api/chat/{account_uid}/end")
+async def end_chat(account_uid: str):
+    """End the active chat → archive it to history and clear the active chat."""
+    sid, meta = await _archive_chat(account_uid)
+    if not sid:
+        return {"ok": True, "ended": False}
+    return {"ok": True, "ended": True, "session_id": sid, "meta": meta}
+
+
+@app.get("/api/chat/{account_uid}/history")
+async def chat_history(account_uid: str):
+    sids = await state["redis"].lrange(f"chat:{account_uid}:history", 0, -1)
+    out = []
+    for sid in sids:
+        raw = await state["redis"].get(f"chat:session:{sid}")
+        if raw:
+            try:
+                m = json.loads(raw)
+                m["session_id"] = sid
+                out.append(m)
+            except json.JSONDecodeError:
+                pass
+    out.sort(key=lambda m: m.get("ended_at", 0), reverse=True)
+    return out
+
+
+@app.get("/api/chat/session/{session_id}")
+async def chat_session_detail(session_id: str):
+    raw_meta = await state["redis"].get(f"chat:session:{session_id}")
+    if not raw_meta:
+        return JSONResponse({"error": "Chat session not found"}, 404)
+    meta = json.loads(raw_meta)
+    uid = meta.get("account_uid", "")
+    raw_turns = await state["redis"].lrange(f"chat:{uid}:session:{session_id}", 0, -1)
+    turns = [json.loads(x) for x in raw_turns] if raw_turns else []
+    account = await state["redis"].hgetall(f"account:{uid}") or {}
+    prompt = meta.get("prompt", "")
+    if not prompt:
+        # Back-fill for sessions created before prompt tracking existed
+        prompt = await _effective_prompt(account)
+    return {
+        "session_id": session_id,
+        "meta": meta,
+        "turns": turns,
+        "config": {"llm_model": meta.get("llm_model", ""), "prompt": prompt},
+        "timing": {
+            "llm_avg_ms": meta.get("llm_avg_ms", 0),
+            "llm_count": meta.get("llm_count", 0),
+            "ttr_avg_ms": meta.get("llm_avg_ms", 0),
+        },
+        "account": {
+            "Patient Name": account.get("Patient Name", ""),
+            "Responsible Payer": account.get("Responsible Payer", ""),
+            "DOS": account.get("DOS", ""),
+            "Claim ID": account.get("Claim ID") or account.get("Account Number", ""),
+        },
+    }
 
 
 @app.get("/api/accounts/{account_uid}/calls")
@@ -1133,7 +1342,7 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
     if account_uid:
         account = await state["redis"].hgetall(f"account:{account_uid}") or None
 
-    system_prompt = build_call_prompt("GREETING", None, None, account)
+    system_prompt = await _effective_prompt(account)
     conversation: list[dict] = [{"role": "system", "content": system_prompt}]
 
     # TTR timing accumulators (ms) — must exist before greeting TTS

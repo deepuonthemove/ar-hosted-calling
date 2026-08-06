@@ -106,9 +106,7 @@ class CallSession:
         if self.payer_data:
             denial_subset = self.payer_data.get("common_denials")
 
-        self.system_prompt = build_call_prompt(
-            "GREETING", self.payer_data, denial_subset, self.account
-        )
+        self.system_prompt = await self._resolve_prompt(self.account)
         self.conversation = [{"role": "system", "content": self.system_prompt}]
         self.watchdog_task = asyncio.create_task(self._silence_watchdog())
 
@@ -144,10 +142,7 @@ class CallSession:
                 payer_name = self.account.get("Responsible Payer") if self.account else None
                 if payer_name:
                     self.payer_data = load_payer(payer_name)
-                denial_subset = self.payer_data.get("common_denials") if self.payer_data else None
-                self.system_prompt = build_call_prompt(
-                    "GREETING", self.payer_data, denial_subset, self.account
-                )
+                self.system_prompt = await self._resolve_prompt(self.account)
 
         log.info("[%s] Stream started: %s | state=%s", self.call_sid, self.stream_sid, self.state)
         await self.redis.hset(f"call:{self.call_sid}", mapping={"status": "in-progress"})
@@ -351,6 +346,22 @@ class CallSession:
         elif self.state == "STATUS_GATHER" and any(w in lower for w in ["paid", "approved"]):
             self.state = "APPROVED_HANDLE"
             log.info("[%s] state: → APPROVED_HANDLE", self.call_sid)
+
+    # ── Custom LLM context (per-account override) ──────────────────────
+    async def _resolve_prompt(self, account: dict | None) -> str:
+        if not account:
+            return build_call_prompt("GREETING", None, None, None)
+        uid = account.get("UID", "")
+        custom = None
+        if uid:
+            custom = await self.redis.get(f"account:{uid}:llm_context")
+        notes = account.get("Notes", "")
+        if custom:
+            prompt = custom
+            if notes:
+                prompt += f"\n\n[PRIOR CALL NOTES]\n{notes}"
+            return prompt
+        return build_call_prompt("GREETING", None, None, account)
 
     # ── Live transcript (for UI polling during a call) ──────────────────
     async def _live_append(self, turn: dict):

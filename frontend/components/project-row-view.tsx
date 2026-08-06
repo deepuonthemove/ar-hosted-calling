@@ -9,6 +9,8 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { CallFlow } from "@/components/call-flow";
+import { ChatPanel } from "@/components/chat-panel";
+import { LlmContextEditor } from "@/components/llm-context-editor";
 import { ArrowLeft, PlusCircle } from "lucide-react";
 
 export function ProjectRowView({ projectId, rowNum }: { projectId: string; rowNum: number }) {
@@ -17,7 +19,17 @@ export function ProjectRowView({ projectId, rowNum }: { projectId: string; rowNu
   const [note, setNote] = useState("");
   const [err, setErr] = useState("");
   const [callActive, setCallActive] = useState(false);
+  const [tabActive, setTab] = useState<"call" | "chat">("call");
+  const [chatSessions, setChatSessions] = useState<any[]>([]);
   const uidRef = useRef("");
+
+  const loadChatHistory = async () => {
+    if (!uidRef.current) return;
+    try {
+      const h = await api<any[]>(`/api/chat/${uidRef.current}/history`);
+      setChatSessions(h);
+    } catch {}
+  };
 
   const load = async () => {
     try {
@@ -25,6 +37,7 @@ export function ProjectRowView({ projectId, rowNum }: { projectId: string; rowNu
       setAcct(d.account);
       uidRef.current = d.account_uid;
       api<CallRecord[]>(`/api/accounts/${d.account_uid}/calls`).then(setHistory).catch(() => {});
+      loadChatHistory();
     } catch (e: any) { setErr(String(e)); }
   };
   useEffect(() => { load(); }, [projectId, rowNum]);
@@ -118,35 +131,90 @@ export function ProjectRowView({ projectId, rowNum }: { projectId: string; rowNu
               </div>
             </CardContent>
           </Card>
-        </div>
-
-        <div className="space-y-6">
-          <CallFlow projectId={projectId} rowNum={rowNum} accountUid={acct["UID"] || ""} onActiveChange={setCallActive} />
 
           <Card>
             <CardHeader>
-              <CardTitle>Call History</CardTitle>
-              <CardDescription>All calls for this claim</CardDescription>
+              <CardTitle>LLM Context</CardTitle>
+              <CardDescription>Custom system prompt for this account's chats & calls (notes are appended automatically)</CardDescription>
             </CardHeader>
             <CardContent>
-              {history.length === 0 ? (
-                <p className="text-sm text-muted-foreground">No calls yet.</p>
+              <LlmContextEditor accountUid={acct["UID"] || ""} />
+            </CardContent>
+          </Card>
+        </div>
+
+        <div className="space-y-6">
+          <Card>
+            <div className="flex border-b">
+              {(["call", "chat"] as const).map((tab) => (
+                <button
+                  key={tab}
+                  onClick={() => setTab(tab)}
+                  className={`px-4 py-2.5 text-sm font-medium capitalize transition-colors ${
+                    tab === tabActive ? "border-b-2 border-primary text-primary" : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {tab}
+                </button>
+              ))}
+            </div>
+            <CardContent className="pt-4">
+              {tabActive === "call" ? (
+                <div className="space-y-6">
+                  <CallFlow projectId={projectId} rowNum={rowNum} accountUid={acct["UID"] || ""} onActiveChange={setCallActive} />
+
+                  <div>
+                    <div className="mb-2 text-sm font-semibold">Call History</div>
+                    {history.length === 0 ? (
+                      <p className="text-sm text-muted-foreground">No calls yet.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {history.map((c) => {
+                          const id = c.call_id || c.callSid || "";
+                          return (
+                            <Link key={id} href={`/calls/${id}`} className="flex items-center justify-between rounded-md border px-3 py-2 hover:bg-accent">
+                              <div className="flex items-center gap-2">
+                                <Badge variant={c.status === "completed" ? "success" : "secondary"}>{c.status}</Badge>
+                                <span className="font-mono text-xs">{id}</span>
+                              </div>
+                              <div className="text-xs text-muted-foreground">
+                                {c.started_at ? new Date(Number(c.started_at) * 1000).toLocaleString() : ""}
+                              </div>
+                            </Link>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </div>
               ) : (
-                <div className="space-y-2">
-                  {history.map((c) => {
-                    const id = c.call_id || c.callSid || "";
-                    return (
-                      <Link key={id} href={`/calls/${id}`} className="flex items-center justify-between rounded-md border px-3 py-2 hover:bg-accent">
-                        <div className="flex items-center gap-2">
-                          <Badge variant={c.status === "completed" ? "success" : "secondary"}>{c.status}</Badge>
-                          <span className="font-mono text-xs">{id}</span>
-                        </div>
-                        <div className="text-xs text-muted-foreground">
-                          {c.started_at ? new Date(Number(c.started_at) * 1000).toLocaleString() : ""}
-                        </div>
-                      </Link>
-                    );
-                  })}
+                <div className="space-y-6">
+                  <ChatPanel accountUid={acct["UID"] || ""} onEnded={loadChatHistory} />
+
+                  <div>
+                    <div className="mb-2 text-sm font-semibold">Chat History</div>
+                    {chatSessions.length === 0 ? (
+                      <p className="text-sm text-muted-foreground">No ended chats yet. End a chat to archive it here.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {chatSessions.map((s) => (
+                          <Link
+                            key={s.session_id}
+                            href={`/chat/history/${s.session_id}`}
+                            className="flex items-center justify-between rounded-md border px-3 py-2 hover:bg-accent"
+                          >
+                            <div className="flex items-center gap-2">
+                              <Badge variant="secondary">{s.count} msgs</Badge>
+                              <span className="max-w-[240px] truncate text-xs">{s.preview || "(empty)"}</span>
+                            </div>
+                            <div className="text-xs text-muted-foreground">
+                              {s.ended_at ? new Date(s.ended_at * 1000).toLocaleString() : ""}
+                            </div>
+                          </Link>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
             </CardContent>
