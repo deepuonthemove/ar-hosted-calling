@@ -13,8 +13,13 @@ export default function DashboardPage() {
   const [err, setErr] = useState("");
 
   useEffect(() => {
-    api<CallRecord[]>("/api/calls").then(setCalls).catch((e) => setErr(String(e)));
-    api<Project[]>("/api/projects").then(setProjects).catch(() => {});
+    const load = () => {
+      api<CallRecord[]>("/api/calls").then(setCalls).catch((e) => setErr(String(e)));
+      api<Project[]>("/api/projects").then(setProjects).catch(() => {});
+    };
+    load();
+    const t = setInterval(load, 5000); // auto-refresh
+    return () => clearInterval(t);
   }, []);
 
   const completed = calls.filter((c) => c.status === "completed").length;

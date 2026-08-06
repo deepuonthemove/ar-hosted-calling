@@ -75,7 +75,11 @@ export function ProjectsTable({ projectId, accounts }: { projectId: string; acco
               </tr>
             ) : (
               filtered.map((r) => (
-                <tr key={r.account_uid || r.row_num} className="border-b last:border-0 hover:bg-accent">
+                <tr
+                  key={r.account_uid || r.row_num}
+                  onClick={() => router.push(`/projects/${projectId}/${r.row_num}`)}
+                  className="cursor-pointer border-b last:border-0 hover:bg-accent"
+                >
                   <td className="p-2">{r.row_num}</td>
                   <td className="p-2 font-medium">{r.Patient}</td>
                   <td className="p-2">{r.DOS}</td>
@@ -85,7 +89,14 @@ export function ProjectsTable({ projectId, accounts }: { projectId: string; acco
                   <td className="p-2">{r.Account}</td>
                   <td className="p-2">{r.Status}</td>
                   <td className="p-2">
-                    <Button size="sm" variant="outline" onClick={() => router.push(`/projects/${projectId}/${r.row_num}`)}>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        router.push(`/projects/${projectId}/${r.row_num}`);
+                      }}
+                    >
                       <Eye className="mr-1 h-3.5 w-3.5" /> View
                     </Button>
                   </td>

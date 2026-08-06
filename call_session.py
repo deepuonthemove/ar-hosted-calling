@@ -154,6 +154,7 @@ class CallSession:
 
         greeting = build_greeting(self.account)
         self.conversation.append({"role": "assistant", "content": greeting})
+        await self._live_append({"role": "assistant", "text": greeting})
         await self._speak(greeting)
         self.state = "IVR_NAV"
 
