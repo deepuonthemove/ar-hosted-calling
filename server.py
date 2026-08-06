@@ -126,6 +126,26 @@ def tts_text(text: str) -> str:
     return _NUM_ID_RE.sub(lambda m: " ".join(m.group()), text)
 
 
+def _piper_next(gen):
+    # Sentinel wrapper: StopIteration must not cross the executor/Future boundary.
+    try:
+        return next(gen)
+    except StopIteration:
+        return None
+
+
+# Serializes in-process Piper synthesis. The shared ONNX session is not safe
+# under concurrency (e.g. a cancelled TTS leaving an executor thread mid-inference).
+_tts_lock = None
+
+
+async def _get_tts_lock():
+    global _tts_lock
+    if _tts_lock is None:
+        _tts_lock = asyncio.Lock()
+    return _tts_lock
+
+
 # ── Piper TTS streaming ──────────────────────────────────────────────────
 async def tts_stream(text: str):
     text = tts_text(text)
@@ -134,14 +154,15 @@ async def tts_stream(text: str):
         # Persistent in-process model — first audio in ~0.1s (vs ~1.8s subprocess)
         from piper.config import SynthesisConfig
         cfg = SynthesisConfig(length_scale=PIPER_LENGTH_SCALE)
-        gen = voice.synthesize(text, cfg)
-        loop = asyncio.get_running_loop()
-        while True:
-            try:
-                chunk = await loop.run_in_executor(None, next, gen)
-            except StopIteration:
-                break
-            yield chunk.audio_int16_bytes
+        lock = await _get_tts_lock()
+        async with lock:
+            gen = voice.synthesize(text, cfg)
+            loop = asyncio.get_running_loop()
+            while True:
+                chunk = await loop.run_in_executor(None, _piper_next, gen)
+                if chunk is None:
+                    break
+                yield chunk.audio_int16_bytes
         return
 
     # Fallback: subprocess
@@ -246,41 +267,72 @@ async def transcribe_full_audio(audio_bytes: bytes) -> str:
 
 
 async def _save_review(session_id: str, conversation: list[dict], full_audio: bytes,
-                       call_duration: float, account_uid: str = "", started_at: float = 0.0):
+                       call_duration: float, account_uid: str = "", started_at: float = 0.0,
+                       tts_engine: str = "", vad_mode: str = "", system_prompt: str = "",
+                       stt_total_ms: float = 0.0, stt_count: int = 0,
+                       llm_total_ms: float = 0.0, llm_count: int = 0,
+                       tts_total_ms: float = 0.0, tts_count: int = 0):
     """Save audio buffer, spawn offline STT, store review data."""
     r = state["redis"]
     audio_key = f"call:{session_id}:audio"
     review_key = f"call:{session_id}:review"
 
-    # Create a call record so browser calls appear in the feed/review list
-    # (don't clobber claim_id/payer/next_action if CALL_RESULT already stored them)
+    # Create a call record so browser calls appear in the feed/review list.
+    # Use the account context for payer/claim when CALL_RESULT didn't store them.
     existing = await r.hgetall(f"call:{session_id}")
+    acct = await r.hgetall(f"account:{account_uid}") if account_uid else {}
     await r.hset(f"call:{session_id}", mapping={
-        "claim_id": existing.get("claim_id") or "browser",
-        "payer": existing.get("payer") or "browser",
+        "claim_id": (existing.get("claim_id") or acct.get("Claim ID")
+                     or acct.get("Account Number") or "unknown"),
+        "payer": existing.get("payer") or acct.get("Responsible Payer") or "unknown",
         "account_uid": account_uid,
-        "status": "completed",
+        # Only "completed" if a CALL_RESULT produced a real outcome; otherwise failed
+        "status": existing.get("status") or "failed",
         "started_at": str(started_at or time.time()),
         "ended_at": str(time.time()),
         "duration_ms": str(int(call_duration * 1000)),
-        "next_action": existing.get("next_action") or "browser test",
+        "next_action": existing.get("next_action", ""),
+        # TTR metrics
+        "stt_avg_ms": str(int(stt_total_ms / max(1, stt_count))),
+        "llm_avg_ms": str(int(llm_total_ms / max(1, llm_count))),
+        "tts_avg_ms": str(int(tts_total_ms / max(1, tts_count))),
+        "ttr_avg_ms": str(int((stt_total_ms / max(1, stt_count))
+                              + (llm_total_ms / max(1, llm_count))
+                              + (tts_total_ms / max(1, tts_count)))),
     })
 
     # Save audio to Redis (24h TTL)
     if full_audio:
         await r.setex(audio_key, 86400, full_audio)
 
-    # Extract real-time user utterances and AI responses
+    # Extract real-time user utterances, AI responses, and interleaved transcript
     real_time = []
     ai_responses = []
+    transcript = []
     for msg in conversation:
         role = msg.get("role", "")
         content = msg.get("content", "")
         if role == "user":
             cleaned = content.replace("[INSURANCE REP] ", "", 1)
             real_time.append(cleaned)
+            transcript.append({"role": "user", "text": cleaned})
         elif role == "assistant":
             ai_responses.append(content)
+            transcript.append({"role": "assistant", "text": strip_markers(content)})
+
+    # Store call config/meta + full interleaved transcript
+    try:
+        await r.set(f"call:{session_id}:transcript", json.dumps(transcript))
+        await r.hset(f"call:{session_id}:meta", mapping={
+            "stt_model": WHISPER_MODEL_SIZE,
+            "tts_engine": tts_engine or TTS_ENGINE,
+            "vad_mode": vad_mode or VAD_MODE,
+            "llm_model": state["llm_model"],
+            "prompt": system_prompt,
+            "call_sid": session_id,
+        })
+    except Exception as e:
+        log.error("[%s] Meta save error: %s", session_id, e)
 
     # Run offline STT in background
     async def _offline_stt():
@@ -342,13 +394,22 @@ async def make_call(request: Request):
     if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER]):
         return JSONResponse({"error": "Twilio credentials not configured"}, 400)
 
+    # Resolve account context from project_id + row_num if provided
+    account_uid = data.get("account_uid", "")
+    if data.get("project_id") and data.get("row_num"):
+        _uid, acct = await _resolve_account(data["project_id"], int(data["row_num"]))
+        if not acct:
+            return JSONResponse({"error": f"No account for project {data['project_id']} row {data['row_num']}"}, 404)
+        account_uid = _uid or ""
+        data.setdefault("payer", acct.get("Responsible Payer", "unknown"))
+        data.setdefault("claim_id", acct.get("Claim ID") or acct.get("Account Number") or "unknown")
+
     payer = data.get("payer", "unknown")
     claim_id = data.get("claim_id", "unknown")
-    account_uid = data.get("account_uid", "")
-    call_sid = f"local-{uuid.uuid4().hex[:16]}"
+    call_id = f"call-{uuid.uuid4().hex[:12]}"
 
-    # Pre-create the call record (ported from /voice handler)
-    await state["redis"].hset(f"call:{call_sid}", mapping={
+    # Pre-create the call record keyed by a stable call_id (ported from /voice handler)
+    await state["redis"].hset(f"call:{call_id}", mapping={
         "claim_id": claim_id, "payer": payer, "account_uid": account_uid,
         "phone": phone, "status": "dialing", "started_at": str(time.time()),
     })
@@ -357,10 +418,11 @@ async def make_call(request: Request):
     from twilio.base.exceptions import TwilioRestException
     try:
         client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        webhook = _voice_webhook(payer, claim_id, account_uid, call_sid)
+        webhook = _voice_webhook(payer, claim_id, account_uid, call_id)
         call = client.calls.create(to=phone, from_=TWILIO_FROM_NUMBER, url=webhook)
-        await state["redis"].rename(f"call:{call_sid}", f"call:{call.sid}")
-        return {"ok": True, "callSid": call.sid}
+        # Keep the stable call_id as the record key; store the Twilio SID as a field
+        await state["redis"].hset(f"call:{call_id}", mapping={"twilio_sid": call.sid})
+        return {"ok": True, "call_id": call_id, "callSid": call.sid}
     except TwilioRestException as e:
         return JSONResponse({"error": f"Twilio API error: {e.msg}"}, 500)
 
@@ -397,23 +459,23 @@ async def make_call_enriched(request: Request):
     await r.hset(f"account:{account_uid}", mapping=record)
 
     # Call standard make_call logic
-    call_sid = f"local-{uuid.uuid4().hex[:16]}"
-    await r.hset(f"call:{call_sid}", mapping={
+    call_id = f"call-{uuid.uuid4().hex[:12]}"
+    await r.hset(f"call:{call_id}", mapping={
         "claim_id": claim_id, "payer": payer, "account_uid": account_uid,
         "phone": phone, "status": "dialing", "started_at": str(time.time()),
     })
 
     if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER]):
-        return JSONResponse({"ok": True, "callSid": call_sid, "warning": "Twilio not configured; mock mode active"})
+        return JSONResponse({"ok": True, "call_id": call_id, "callSid": call_id, "warning": "Twilio not configured; mock mode active"})
 
     from twilio.rest import Client as TwilioClient
     from twilio.base.exceptions import TwilioRestException
     try:
         client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        webhook = _voice_webhook(payer, claim_id, account_uid, call_sid)
+        webhook = _voice_webhook(payer, claim_id, account_uid, call_id)
         call = client.calls.create(to=phone, from_=TWILIO_FROM_NUMBER, url=webhook)
-        await r.rename(f"call:{call_sid}", f"call:{call.sid}")
-        return {"ok": True, "callSid": call.sid}
+        await r.hset(f"call:{call_id}", mapping={"twilio_sid": call.sid})
+        return {"ok": True, "call_id": call_id, "callSid": call.sid}
     except TwilioRestException as e:
         return JSONResponse({"error": f"Twilio API error: {e.msg}"}, 500)
 
@@ -437,7 +499,9 @@ async def voice_webhook(request: Request):
     """Twilio webhook → TwiML with Media Stream (ported)."""
     q = request.query_params
     form = await request.form() if request.method == "POST" else {}
-    call_sid = (form.get("CallSid") if form else None) or q.get("CallSid") or q.get("local_sid", "unknown")
+    # Prefer local_sid (our call_id) so the media stream + live transcript key on
+    # the id returned by /make-call — the one the UI polls.
+    call_sid = q.get("local_sid") or q.get("CallSid") or (form.get("CallSid") if form else None) or "unknown"
 
     # Ensure call record exists with context
     existing = await state["redis"].hgetall(f"call:{call_sid}")
@@ -465,7 +529,8 @@ async def voice_webhook(request: Request):
 @app.websocket("/media/{call_sid}")
 async def media_stream(ws: WebSocket, call_sid: str):
     """Twilio Media Streams WebSocket → CallSession (ported from DO)."""
-    engine = TTS_ENGINE
+    _cfg = await _get_config()
+    engine = _cfg["tts_engine"]
     call_record = await state["redis"].hgetall(f"call:{call_sid}")
     if call_record and call_record.get("tts_engine"):
         engine = call_record["tts_engine"]
@@ -476,7 +541,10 @@ async def media_stream(ws: WebSocket, call_sid: str):
         "llm_client": state["llm_client"],
         "llm_model": state["llm_model"],
         "tts_stream_fn": get_tts_fn(engine),
-        "use_silero": VAD_MODE == "silero",
+        "tts_engine": engine,
+        "vad_mode": _cfg["vad_mode"],
+        "stt_model_name": WHISPER_MODEL_SIZE,
+        "use_silero": _cfg["vad_mode"] == "silero",
     })
     await session.run()
 
@@ -514,9 +582,12 @@ async def retry_call(call_sid: str):
 # DATA APIs  (ported: calls list, CSV export, secrets check)
 # ════════════════════════════════════════════════════════════════════════
 
+_SUFFIX_EXCLUDE = (":audio", ":review", ":transcript", ":meta", ":live")
+
+
 def _call_record_keys(keys):
-    """Filter Redis keys to actual call record hashes (exclude audio/review strings)."""
-    return [k for k in keys if not k.endswith(":audio") and not k.endswith(":review")]
+    """Filter Redis keys to actual call record hashes (exclude sub-keys)."""
+    return [k for k in keys if not k.endswith(_SUFFIX_EXCLUDE)]
 
 
 @app.get("/api/calls")
@@ -575,6 +646,19 @@ async def check_secrets():
 # EXCEL  (ported from src/index.ts upload/accounts/export)
 # ════════════════════════════════════════════════════════════════════════
 
+async def _resolve_account(project_id: str, row_num: int) -> tuple[str | None, dict | None]:
+    """Resolve (project_id, row_num) → (account_uid, account_record). Row 1 = first data row."""
+    raw = await state["redis"].get(f"project:{project_id}:rows")
+    if not raw:
+        return None, None
+    uids = json.loads(raw)
+    if not (1 <= row_num <= len(uids)):
+        return None, None
+    uid = uids[row_num - 1]
+    acct = await state["redis"].hgetall(f"account:{uid}") or None
+    return uid, acct
+
+
 @app.post("/api/upload-excel")
 async def upload_excel(file: UploadFile = File(...)):
     try:
@@ -588,11 +672,8 @@ async def upload_excel(file: UploadFile = File(...)):
         headers = [str(h) if h else f"col_{i}" for i, h in enumerate(rows[0])]
         r = state["redis"]
 
-        # Clear old accounts (ported)
-        old_uids = await r.get("accounts-list")
-        if old_uids:
-            for uid in json.loads(old_uids):
-                await r.delete(f"account:{uid}")
+        # Generate a unique project id for this upload
+        project_id = f"proj-{uuid.uuid4().hex[:10]}"
 
         uids = []
         for i, row in enumerate(rows[1:]):
@@ -600,18 +681,98 @@ async def upload_excel(file: UploadFile = File(...)):
             for j, val in enumerate(row):
                 if j < len(headers) and val is not None:
                     record[headers[j]] = val.isoformat() if hasattr(val, "isoformat") else str(val)
-            uid = record.get("UID") or f"KS-PC-{i}-{int(time.time())}"
+            uid = record.get("UID") or f"{project_id}-{i}-{int(time.time())}"
             record["UID"] = uid
             record.setdefault("Call Status", "Pending")
             uids.append(uid)
             await r.hset(f"account:{uid}", mapping=record)
 
+        # Project-scoped row index: index 0 = row 1 = first data row
+        await r.set(f"project:{project_id}:rows", json.dumps(uids))
+        await r.set(f"project:{project_id}:headers", json.dumps(headers))
+        # Keep legacy lists for the UI (last project shown)
         await r.set("accounts-headers", json.dumps(headers))
         await r.set("accounts-list", json.dumps(uids))
-        return {"ok": True, "count": len(uids)}
+        return {"ok": True, "count": len(uids), "project_id": project_id}
     except Exception as e:
         log.error("Excel parse error: %s", e)
         return JSONResponse({"error": f"Parsing error: {e}"}, 500)
+
+
+@app.get("/api/projects/{project_id}/accounts/{row_num}")
+async def get_project_account(project_id: str, row_num: int):
+    """Resolve an account by project + row number (row 1 = first data row)."""
+    uid, acct = await _resolve_account(project_id, row_num)
+    if not acct:
+        return JSONResponse({"error": f"No account for project {project_id} row {row_num}"}, 404)
+    return {"account_uid": uid, "account": acct}
+
+
+@app.get("/api/projects")
+async def list_projects():
+    """List all uploaded projects with row counts."""
+    keys = await state["redis"].keys("project:*:rows")
+    projects = []
+    for key in keys:
+        pid = key.replace("project:", "").replace(":rows", "")
+        raw = await state["redis"].get(key)
+        try:
+            count = len(json.loads(raw)) if raw else 0
+        except json.JSONDecodeError:
+            count = 0
+        projects.append({"project_id": pid, "rows": count})
+    projects.sort(key=lambda p: p["project_id"], reverse=True)
+    return projects
+
+
+@app.get("/api/projects/{project_id}/accounts")
+async def list_project_accounts(project_id: str):
+    raw = await state["redis"].get(f"project:{project_id}:rows")
+    if not raw:
+        return []
+    uids = json.loads(raw)
+    accounts = []
+    for uid in uids:
+        row = await state["redis"].hgetall(f"account:{uid}")
+        if row:
+            accounts.append(row)
+    return accounts
+
+
+@app.post("/api/notes")
+async def add_note(request: Request):
+    """Add a note to an account (used as context on the next call).
+    Body: {account_uid} or {project_id, row_num} plus {note}."""
+    data = await request.json()
+    note = (data.get("note") or "").strip()
+    if not note:
+        return JSONResponse({"error": "note is required"}, 400)
+
+    uid = data.get("account_uid", "")
+    if not uid and data.get("project_id") and data.get("row_num"):
+        uid, _ = await _resolve_account(data["project_id"], int(data["row_num"]))
+    if not uid:
+        return JSONResponse({"error": "account_uid or project_id+row_num required"}, 400)
+
+    account = await state["redis"].hgetall(f"account:{uid}") or {}
+    prior = account.get("Notes", "")
+    now = time.strftime("%Y-%m-%d %H:%M")
+    merged = (prior + "\n" if prior else "") + f"[{now}] {note}"
+    await state["redis"].hset(f"account:{uid}", mapping={"Notes": merged})
+    return {"ok": True, "account_uid": uid, "notes": merged}
+
+
+@app.get("/api/accounts/{account_uid}/calls")
+async def account_call_history(account_uid: str):
+    """Call history for a given account/claim."""
+    keys = _call_record_keys(await state["redis"].keys("call:*"))
+    calls = []
+    for key in keys:
+        data = await state["redis"].hgetall(key)
+        if data and data.get("account_uid") == account_uid:
+            calls.append({"call_id": key.replace("call:", ""), **data})
+    calls.sort(key=lambda c: float(c.get("started_at", 0)), reverse=True)
+    return calls
 
 
 @app.get("/api/accounts")
@@ -728,6 +889,16 @@ async def switch_llm(request: Request):
     return {"ok": True, "model": model_id, "switching": True}
 
 
+@app.get("/api/calls/{session_id}/live")
+async def get_live_transcript(session_id: str):
+    """Live transcript for an in-progress call (UI polls this)."""
+    raw = await state["redis"].lrange(f"call:{session_id}:live", 0, -1)
+    turns = [json.loads(x) for x in raw] if raw else []
+    record = await state["redis"].hgetall(f"call:{session_id}")
+    active = bool(record) and "ended_at" not in record
+    return {"call_id": session_id, "active": active, "transcript": turns}
+
+
 @app.get("/api/calls/{session_id}/review")
 async def get_review(session_id: str):
     review_key = f"call:{session_id}:review"
@@ -737,8 +908,124 @@ async def get_review(session_id: str):
     return JSONResponse(json.loads(data))
 
 
+@app.get("/api/calls/{call_id}/detail")
+async def get_call_detail(call_id: str):
+    """Full detail for a call: config (STT/TTS/LLM/prompt), interleaved transcript, review."""
+    r = state["redis"]
+    record = await r.hgetall(f"call:{call_id}")
+    if not record:
+        return JSONResponse({"error": "Call not found"}, 404)
+
+    meta = await r.hgetall(f"call:{call_id}:meta")
+
+    transcript = []
+    raw_t = await r.get(f"call:{call_id}:transcript")
+    if raw_t:
+        try:
+            transcript = json.loads(raw_t)
+        except json.JSONDecodeError:
+            transcript = []
+
+    review = None
+    raw_r = await r.get(f"call:{call_id}:review")
+    if raw_r:
+        try:
+            review = json.loads(raw_r)
+        except json.JSONDecodeError:
+            review = None
+
+    # Old calls (pre-transcript feature) — reconstruct interleaved transcript
+    # from the review arrays if no stored transcript exists.
+    if not transcript and review:
+        rt = review.get("real_time", []) or []
+        ai = review.get("ai_responses", []) or []
+        if ai:
+            transcript.append({"role": "assistant", "text": ai[0]})
+        for i, u in enumerate(rt):
+            transcript.append({"role": "user", "text": u})
+            if i + 1 < len(ai):
+                transcript.append({"role": "assistant", "text": ai[i + 1]})
+        if transcript:
+            try:
+                await r.set(f"call:{call_id}:transcript", json.dumps(transcript))
+            except Exception:
+                pass
+
+    return {
+        "call_id": call_id,
+        "twilio_sid": record.get("twilio_sid", ""),
+        "call": {k: v for k, v in record.items()},
+        "config": {
+            "stt_model": meta.get("stt_model", "unknown"),
+            "tts_engine": meta.get("tts_engine", "unknown"),
+            "vad_mode": meta.get("vad_mode", "unknown"),
+            "llm_model": meta.get("llm_model", "unknown"),
+        },
+        "prompt": meta.get("prompt", ""),
+        "transcript": transcript,
+        "review": review,
+    }
+
+
+# ── App config (TTS/VAD defaults, persisted in Redis, editable via API) ─
+CONFIG_KEY = "config:app"
+
+
+async def _get_config() -> dict:
+    cfg = await state["redis"].hgetall(CONFIG_KEY)
+    return {
+        "tts_engine": cfg.get("tts_engine", TTS_ENGINE),
+        "vad_mode": cfg.get("vad_mode", VAD_MODE),
+        "stay_awake": cfg.get("stay_awake", "0"),
+    }
+
+
+async def _set_config(**kwargs):
+    await state["redis"].hset(CONFIG_KEY, mapping={k: str(v) for k, v in kwargs.items()})
+
+
+@app.get("/api/config")
+async def get_config():
+    cfg = await _get_config()
+    return {
+        "tts_engine": cfg["tts_engine"],
+        "vad_mode": cfg["vad_mode"],
+        "stay_awake": cfg["stay_awake"] == "1",
+        "tts_options": ["piper", "kokoro"],
+        "vad_options": ["silero", "rms"],
+        "llm_model": state["llm_model"],
+        "llm_options": state["llm_options"],
+    }
+
+
+@app.post("/api/config")
+async def post_config(request: Request):
+    data = await request.json()
+    updates = {}
+    if "tts_engine" in data:
+        if data["tts_engine"] not in ("piper", "kokoro"):
+            return JSONResponse({"error": "tts_engine must be piper or kokoro"}, 400)
+        updates["tts_engine"] = data["tts_engine"]
+    if "vad_mode" in data:
+        if data["vad_mode"] not in ("silero", "rms"):
+            return JSONResponse({"error": "vad_mode must be silero or rms"}, 400)
+        updates["vad_mode"] = data["vad_mode"]
+    if "stay_awake" in data:
+        updates["stay_awake"] = "1" if data["stay_awake"] else "0"
+    if updates:
+        await _set_config(**updates)
+    return {"ok": True, "config": await _get_config()}
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
+    try:
+        from pathlib import Path
+        path = Path(__file__).parent / "static" / "dashboard.html"
+        if path.exists():
+            return HTMLResponse(path.read_text())
+    except Exception:
+        pass
     return DASHBOARD_HTML
 
 
@@ -807,22 +1094,37 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
     await ws.accept()
     await ws.send_json({"type": "config", "sample_rate": PIPER_RATE})
 
-    # Parse query params from WebSocket URL
+    # Parse query params from WebSocket URL (override app-config defaults)
     account_uid = ""
-    tts_engine = TTS_ENGINE
-    vad_mode = VAD_MODE
+    project_id = ""
+    row_num = ""
+    _cfg = await _get_config()
+    tts_engine = _cfg["tts_engine"]
+    vad_mode = _cfg["vad_mode"]
     try:
         qs = str(ws.url).split("?")[1] if "?" in str(ws.url) else ""
         for part in qs.split("&"):
             k, _, v = part.partition("=")
             if k == "account_uid" and v:
                 account_uid = v
+            elif k == "project_id" and v:
+                project_id = v
+            elif k == "row_num" and v:
+                row_num = v
             elif k == "tts" and v:
                 tts_engine = v
             elif k == "vad" and v:
                 vad_mode = v
     except Exception:
         pass
+
+    # Resolve account context from project_id + row_num if provided
+    if project_id and row_num:
+        _uid, _acct = await _resolve_account(project_id, int(row_num))
+        if _acct:
+            account_uid = _uid or ""
+        else:
+            log.warning("[%s] No account for project %s row %s", session_id, project_id, row_num)
 
     tts_fn = get_tts_fn(tts_engine)
     use_silero = vad_mode == "silero"
@@ -834,11 +1136,20 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
     system_prompt = build_call_prompt("GREETING", None, None, account)
     conversation: list[dict] = [{"role": "system", "content": system_prompt}]
 
+    # TTR timing accumulators (ms) — must exist before greeting TTS
+    _tts_times = []
+    stt_total_ms = 0.0
+    stt_count = 0
+    llm_total_ms = 0.0
+    llm_count = 0
+    tts_total_ms = 0.0
+    tts_count = 0
+
     # Speak greeting with claim context right away
     greeting = build_greeting(account)
     conversation.append({"role": "assistant", "content": greeting})
     await ws.send_json({"type": "llm_text", "text": greeting})
-    tts_task = asyncio.create_task(_stream_tts_reply(ws, greeting, tts_fn))
+    tts_task = asyncio.create_task(_stream_tts_reply(ws, greeting, tts_fn, _tts_times))
 
     vad = VAD(use_silero=use_silero)
     barge_in = False
@@ -863,7 +1174,10 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             return
         review_saved = True
         await _save_review(session_id, conversation, bytes(full_audio),
-                           time.time() - call_start, account_uid, call_start)
+                           time.time() - call_start, account_uid, call_start,
+                           tts_engine, vad_mode, system_prompt,
+                           stt_total_ms, stt_count, llm_total_ms, llm_count,
+                           tts_total_ms, tts_count)
 
     try:
         while True:
@@ -896,8 +1210,11 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
 
             async with state["stt_lock"]:
                 loop = asyncio.get_running_loop()
+                t0 = time.time()
                 segs, _ = await loop.run_in_executor(
                     None, lambda: state["stt_model"].transcribe(segment, beam_size=1, vad_filter=True))
+                stt_total_ms += (time.time() - t0) * 1000
+                stt_count += 1
                 text = " ".join(s.text for s in segs).strip()
             if len(text) < 3:
                 continue
@@ -913,8 +1230,11 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             conversation.append({"role": "user", "content": f"[INSURANCE REP] {text}"})
             await ws.send_json({"type": "transcript", "text": text})
             conv = conversation if len(conversation) <= 15 else [conversation[0]] + conversation[-14:]
+            t0 = time.time()
             resp = await state["llm_client"].chat.completions.create(
                 model=state["llm_model"], messages=conv, max_tokens=150, temperature=0)
+            llm_total_ms += (time.time() - t0) * 1000
+            llm_count += 1
             reply = resp.choices[0].message.content.strip()
             conversation.append({"role": "assistant", "content": reply})
 
@@ -938,17 +1258,22 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                 await cancel_tts()
                 farewell = "Okay, thank you. Goodbye!"
                 await ws.send_json({"type": "llm_text", "text": farewell})
-                tts_task = asyncio.create_task(_stream_tts_reply(ws, farewell, tts_fn))
+                tts_task = asyncio.create_task(_stream_tts_reply(ws, farewell, tts_fn, _tts_times))
                 if tts_task:
                     try:
-                        await tts_task
+                        await asyncio.wait_for(tts_task, timeout=10)
                     except asyncio.CancelledError:
                         pass
+                    except asyncio.TimeoutError:
+                        log.warning("[%s] Farewell TTS timed out — ending anyway", session_id)
                     except Exception:
                         pass
                 await _finalize_review()
                 await asyncio.sleep(1)
-                await ws.close()
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
                 return
 
             # Strip markers for speech + log display
@@ -956,7 +1281,7 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             await ws.send_json({"type": "llm_text", "text": spoken})
 
             # Stream TTS in background so audio reads continue
-            tts_task = asyncio.create_task(_stream_tts_reply(ws, spoken, tts_fn))
+            tts_task = asyncio.create_task(_stream_tts_reply(ws, spoken, tts_fn, _tts_times))
 
     except Exception:
         pass
@@ -970,14 +1295,19 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                 pass
 
 
-async def _stream_tts_reply(ws: WebSocket, text: str, tts_fn=tts_stream):
+async def _stream_tts_reply(ws: WebSocket, text: str, tts_fn=tts_stream, tts_times: list | None = None):
+    t0 = time.time()
+    first = True
     try:
         async for pcm_bytes in tts_fn(text):
+            if first and tts_times is not None:
+                tts_times.append((time.time() - t0) * 1000)
+                first = False
             await ws.send_bytes(b"\x01" + pcm_bytes)
     except asyncio.CancelledError:
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("[tts] reply stream error: %s", e)
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>

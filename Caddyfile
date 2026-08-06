@@ -1,5 +1,43 @@
 # Requires PUBLIC_DOMAIN set in .env (e.g. voice.example.com pointing at this VM).
 # Falls back to localhost (no TLS) so the container starts even when unset.
 {$PUBLIC_DOMAIN:localhost} {
-	reverse_proxy voice-agent:8080
+	# Voice agent API + WebSocket paths → voice-agent:8080
+	handle /api/* {
+		reverse_proxy voice-agent:8080
+	}
+	handle /ws/* {
+		reverse_proxy voice-agent:8080
+	}
+	handle /make-call* {
+		reverse_proxy voice-agent:8080
+	}
+	handle /voice {
+		reverse_proxy voice-agent:8080
+	}
+	handle /media/* {
+		reverse_proxy voice-agent:8080
+	}
+	handle /call-result {
+		reverse_proxy voice-agent:8080
+	}
+	handle /retry/* {
+		reverse_proxy voice-agent:8080
+	}
+	handle /health {
+		reverse_proxy voice-agent:8080
+	}
+	handle /export.csv {
+		reverse_proxy voice-agent:8080
+	}
+	handle /dashboard {
+		reverse_proxy voice-agent:8080
+	}
+	handle /test {
+		reverse_proxy voice-agent:8080
+	}
+
+	# Everything else → Next.js UI
+	handle {
+		reverse_proxy frontend:3000
+	}
 }

@@ -103,6 +103,19 @@ services:
               count: 1
               capabilities: [gpu]
 
+  # ── Next.js UI (new admin dashboard) ─────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: frontend
+    restart: unless-stopped
+    environment:
+      - NEXT_PUBLIC_API_BASE=${PUBLIC_SCHEME:-https}://${PUBLIC_DOMAIN:-call.ar-voice.com}
+    ports:
+      - "3000:3000"
+    profiles: [prod, tls]
+
   # ── TLS termination (Twilio requires HTTPS webhook + WSS stream) ─────
   # Point a DNS A record at the VM IP and set PUBLIC_DOMAIN in .env.
   # Only runs when the `tls` profile is enabled:
@@ -119,6 +132,8 @@ services:
       - caddy-data:/data
     environment:
       - PUBLIC_DOMAIN=${PUBLIC_DOMAIN:-}
+    depends_on:
+      - frontend
     profiles: [tls]
 
 volumes:

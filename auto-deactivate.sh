@@ -10,8 +10,12 @@ COUNT=$(docker logs voice-agent --since 1h 2>/dev/null \
 
 SSH=$(who 2>/dev/null | wc -l)
 
-echo "  activity=$COUNT ssh=$SSH" >> "$LOG"
+# User toggle: "stay_awake" in Redis disables auto-deactivation while working
+STAY=$(docker exec redis redis-cli hget config:app stay_awake 2>/dev/null)
 
+echo "  activity=$COUNT ssh=$SSH stay_awake=$STAY" >> "$LOG"
+
+[ "$STAY" = "1" ] && echo "  Stay-awake enabled" >> "$LOG" && exit 0
 [ "${COUNT:-0}" -gt 0 ] && echo "  Active" >> "$LOG" && exit 0
 [ "$SSH" -gt 0 ] && echo "  Active (SSH)" >> "$LOG" && exit 0
 

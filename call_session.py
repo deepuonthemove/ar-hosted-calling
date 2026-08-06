@@ -27,6 +27,8 @@ from prompts import (
 
 log = logging.getLogger("call-session")
 
+_bg_tasks: set = set()  # strong refs for background tasks (avoids GC cancellation)
+
 MAX_SILENCE_MS = 19 * 60 * 1000
 HOLD_NUDGE_MS = 10000
 HOLD_POLL_MS = 5000
@@ -48,8 +50,12 @@ class CallSession:
         self.llm_model = deps["llm_model"]
         self.tts_stream_fn = deps["tts_stream_fn"]
         self.use_silero = deps.get("use_silero", True)
+        self.tts_engine = deps.get("tts_engine", "piper")
+        self.vad_mode = deps.get("vad_mode", "silero" if self.use_silero else "rms")
+        self.stt_model_name = deps.get("stt_model_name", "unknown")
 
         self.stream_sid: str | None = None
+        self.full_audio = bytearray()
         self.account_uid = ""
         self.account: dict | None = None
         self.state = "GREETING"
@@ -69,6 +75,14 @@ class CallSession:
         self.tts_task: asyncio.Task | None = None
         self.watchdog_task: asyncio.Task | None = None
         self.last_tts_duration: float = 0.0
+
+        # TTR timing accumulators (ms)
+        self.stt_total_ms = 0.0
+        self.stt_count = 0
+        self.llm_total_ms = 0.0
+        self.llm_count = 0
+        self.tts_total_ms = 0.0
+        self.tts_count = 0
 
     # ── Entry ────────────────────────────────────────────────────────────
     async def run(self):
@@ -145,6 +159,7 @@ class CallSession:
 
     async def _on_media(self, data: dict):
         payload = base64.b64decode(data["media"]["payload"])
+        self.full_audio.extend(payload)  # raw μ-law (8kHz) for offline re-transcription
         audio = twilio_to_whisper(payload)
         now = time.time()
         self.last_activity = now
@@ -163,16 +178,37 @@ class CallSession:
             return
 
         log.info("[%s] Heard: %s", self.call_sid, text)
+        await self._live_append({"role": "user", "text": text})
         await self._run_llm(text)
 
     # ── STT ──────────────────────────────────────────────────────────────
     async def _transcribe(self, audio: np.ndarray) -> str:
         async with self.stt_lock:
             loop = asyncio.get_running_loop()
+            t0 = time.time()
             segments, _ = await loop.run_in_executor(
                 None,
                 lambda: self.stt_model.transcribe(
                     audio, beam_size=1, vad_filter=True, language="en"
+                ),
+            )
+            self.stt_total_ms += (time.time() - t0) * 1000
+            self.stt_count += 1
+            return " ".join(s.text for s in segments).strip()
+
+    async def _transcribe_full(self) -> str:
+        """Offline STT on the full μ-law recording (no VAD)."""
+        if len(self.full_audio) < 3200:
+            return ""
+        from audio import mulaw_to_pcm16, resample
+        pcm = mulaw_to_pcm16(bytes(self.full_audio))               # int16 @8kHz
+        f32 = pcm.astype(np.float32) / 32768.0
+        f32 = resample(f32, 8000, 16000)                           # to Whisper 16kHz
+        async with self.stt_lock:
+            loop = asyncio.get_running_loop()
+            segments, _ = await loop.run_in_executor(
+                None, lambda: self.stt_model.transcribe(
+                    f32, beam_size=5, vad_filter=False, language="en"
                 ),
             )
             return " ".join(s.text for s in segments).strip()
@@ -196,6 +232,7 @@ class CallSession:
         self.conversation.append({"role": "user", "content": f"[INSURANCE REP] [STATE: {self.state}] {user_text}"})
 
         try:
+            llm_t0 = time.time()
             stream = await self.llm_client.chat.completions.create(
                 model=self.llm_model,
                 messages=self.conversation,
@@ -233,9 +270,12 @@ class CallSession:
                 if parsed_tail["spoken"]:
                     await self._speak(parsed_tail["spoken"])
 
+            self.llm_total_ms += (time.time() - llm_t0) * 1000
+            self.llm_count += 1
             log.info("[%s] LLM (state=%s): %s", self.call_sid, self.state, bot_text)
             self.conversation.append({"role": "assistant", "content": bot_text})
             await self.redis.hset(f"call:{self.call_sid}", mapping={"last_llm_response": bot_text})
+            await self._live_append({"role": "assistant", "text": strip_markers(bot_text)})
 
             parsed = parse_markers(bot_text)
 
@@ -311,6 +351,19 @@ class CallSession:
             self.state = "APPROVED_HANDLE"
             log.info("[%s] state: → APPROVED_HANDLE", self.call_sid)
 
+    # ── Live transcript (for UI polling during a call) ──────────────────
+    async def _live_append(self, turn: dict):
+        try:
+            await self.redis.rpush(f"call:{self.call_sid}:live", json.dumps(turn))
+        except Exception:
+            pass
+
+    async def _live_flush(self):
+        try:
+            await self.redis.delete(f"call:{self.call_sid}:live")
+        except Exception:
+            pass
+
     # ── IVR Drift Detection ─────────────────────────────────────────────
     async def _check_ivr_drift(self, dtmf_digit: str):
         """After sending DTMF, if the system expected a verify_phrase
@@ -373,6 +426,7 @@ class CallSession:
     async def _stream_tts(self, text: str):
         try:
             log.info("[%s] TTS start: %r", self.call_sid, text[:40])
+            tts_t0 = time.time()
             frame = bytearray()
             sent_samples = 0
             audio_started = False
@@ -390,6 +444,8 @@ class CallSession:
                     if not audio_started:
                         self.is_bot_speaking = True
                         audio_started = True
+                        self.tts_total_ms += (time.time() - tts_t0) * 1000
+                        self.tts_count += 1
                     await self.ws.send_text(json.dumps({
                         "event": "media",
                         "streamSid": self.stream_sid,
@@ -500,6 +556,7 @@ class CallSession:
             return
         self.is_call_ended = True
         await self._cancel_tts()
+        await self._live_flush()
 
         # If a [CALL_RESULT] was provided, use it.
         # Otherwise, if we have [CALL_RESULT] in the last LLM output, parse it.
@@ -522,8 +579,15 @@ class CallSession:
             started_at = float(call_data.get("started_at", time.time()))
             duration_ms = int((time.time() - started_at) * 1000)
 
+            # Only mark "completed" when a CALL_RESULT produced a real outcome.
+            # Otherwise (no result) treat a "completed"-grade end as failed.
+            if result:
+                final_status = result.get("status", status)
+            else:
+                final_status = "failed" if status in ("completed", "disconnected") else status
+
             update = {
-                "status": (result or {}).get("status", status),
+                "status": final_status,
                 "ended_at": str(time.time()),
                 "duration_ms": str(duration_ms),
             }
@@ -535,6 +599,14 @@ class CallSession:
                         update[key] = str(result[key])
                 update["payer"] = result.get("payer", call_data.get("payer", "unknown"))
                 update["claim_id"] = result.get("claim_id", call_data.get("claim_id", "unknown"))
+            # TTR metrics
+            stt_avg = self.stt_total_ms / max(1, self.stt_count)
+            llm_avg = self.llm_total_ms / max(1, self.llm_count)
+            tts_avg = self.tts_total_ms / max(1, self.tts_count)
+            update["stt_avg_ms"] = str(int(stt_avg))
+            update["llm_avg_ms"] = str(int(llm_avg))
+            update["tts_avg_ms"] = str(int(tts_avg))
+            update["ttr_avg_ms"] = str(int(stt_avg + llm_avg + tts_avg))
             if error:
                 update["last_error"] = error
 
@@ -543,27 +615,58 @@ class CallSession:
                 "callSid": self.call_sid, **update
             }))
 
-            # Save transcript for the review tab
+            # Save transcript for the review tab + full interleaved transcript + call config
             try:
                 real_time = []
                 ai_responses = []
+                transcript = []
                 for msg in self.conversation:
                     content = msg.get("content", "")
-                    if msg.get("role") == "user":
+                    role = msg.get("role", "")
+                    if role == "user":
                         cleaned = content.replace("[INSURANCE REP] ", "", 1)
                         cleaned = re.sub(r"\[STATE: [^\]]*\]\s*", "", cleaned)
                         real_time.append(cleaned)
-                    elif msg.get("role") == "assistant":
+                        transcript.append({"role": "user", "text": cleaned})
+                    elif role == "assistant":
                         ai_responses.append(content)
+                        transcript.append({"role": "assistant", "text": strip_markers(content)})
                 review = {
                     "real_time": real_time,
                     "full_audio": "",
                     "ai_responses": ai_responses,
                     "duration_sec": int(duration_ms / 1000),
-                    "audio_size_bytes": 0,
+                    "audio_size_bytes": len(self.full_audio),
                     "call_result": result,
                 }
                 await self.redis.set(f"call:{self.call_sid}:review", json.dumps(review))
+
+                # Offline STT on the full μ-law recording (background, no VAD)
+                audio_bytes = bytes(self.full_audio)
+                if len(audio_bytes) >= 3200:
+                    async def _offline_full():
+                        try:
+                            text = await self._transcribe_full()
+                            raw = await self.redis.get(f"call:{self.call_sid}:review")
+                            if raw:
+                                rv = json.loads(raw)
+                                rv["full_audio"] = text
+                                await self.redis.set(f"call:{self.call_sid}:review", json.dumps(rv))
+                            log.info("[%s] Offline full-recording STT done (%d chars)", self.call_sid, len(text))
+                        except Exception as e:
+                            log.error("[%s] Offline full STT error: %s", self.call_sid, e)
+                    task = asyncio.create_task(_offline_full())
+                    _bg_tasks.add(task)
+                    task.add_done_callback(_bg_tasks.discard)
+                await self.redis.set(f"call:{self.call_sid}:transcript", json.dumps(transcript))
+                await self.redis.hset(f"call:{self.call_sid}:meta", mapping={
+                    "stt_model": self.stt_model_name,
+                    "tts_engine": self.tts_engine,
+                    "vad_mode": self.vad_mode,
+                    "llm_model": self.llm_model,
+                    "prompt": self.system_prompt,
+                    "call_sid": self.call_sid,
+                })
             except Exception as e:
                 log.error("[%s] Review save error: %s", self.call_sid, e)
 

@@ -187,6 +187,9 @@ def build_call_prompt(state: str, payer_knowledge: dict | None,
         if known_denial:
             denial_info = f"\nKnown Denial Code: {known_denial}"
 
+        notes = account.get("Notes", "")
+        notes_info = f"\nPrior Call Notes: {notes}" if notes else ""
+
         parts.append(
             f"[CLAIM CONTEXT]\n"
             f"Patient: {account.get('Patient Name', account.get('patientName', 'unknown'))}\n"
@@ -195,7 +198,7 @@ def build_call_prompt(state: str, payer_knowledge: dict | None,
             f"Billed: ${account.get('Billed Amount', account.get('billedAmount', '0'))}\n"
             f"Payer: {account.get('Responsible Payer', account.get('provider', 'unknown'))}\n"
             f"Account: {account.get('Account Number', account.get('accountNumber', 'unknown'))}\n"
-            f"Objective: {account.get('AR Final Comments', 'Check claim status')}{denial_info}"
+            f"Objective: {account.get('AR Final Comments', 'Check claim status')}{denial_info}{notes_info}"
         )
 
         # Inject AR Learning Denial Rules if a denial code is known
