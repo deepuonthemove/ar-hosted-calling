@@ -64,12 +64,28 @@ KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "0.9"))
 
 VAD_MODE = os.getenv("VAD_MODE", "silero")  # "rms" or "silero"
 
+# Opik (LLM evaluation/tracing) — optional
+OPIK_ENABLED = os.getenv("OPIK_ENABLED", "0") == "1"
+OPIK_BASE_URL = os.getenv("OPIK_BASE_URL", "http://opik-backend:8080")
+OPIK_API_KEY = os.getenv("OPIK_API_KEY", "")
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ar-voice-agent")
 
 # ── Shared state ─────────────────────────────────────────────────────────
 state: dict = {}
 _bg_tasks: set = set()  # strong refs for background tasks (avoids GC cancellation)
+
+
+def opik_span(name: str, input_data, output_data, metadata: dict | None = None):
+    """Log a span to Opik (no-op if Opik is disabled/unavailable)."""
+    client = state.get("opik")
+    if not client:
+        return
+    try:
+        client.span(name=name, input=input_data, output=output_data, metadata=metadata or {})
+    except Exception:
+        pass
 
 
 def load_models():
@@ -97,6 +113,21 @@ def load_models():
     except Exception as e:
         log.warning("Kokoro not available, will fall back to Piper: %s", e)
         state["kokoro_pipeline"] = None
+
+    # Opik LLM evaluation/tracing
+    if OPIK_ENABLED:
+        try:
+            import opik as opik_sdk
+            opik_sdk.configure(api_key=OPIK_API_KEY or "local", use_local=True,
+                               url_override=OPIK_BASE_URL, project_name="ar-voice-agent")
+            opik_client = opik_sdk.Opik()
+            state["opik"] = opik_client
+            log.info("Opik enabled at %s", OPIK_BASE_URL)
+        except Exception as e:
+            log.warning("Opik init failed (disabled): %s", e)
+            state["opik"] = None
+    else:
+        state["opik"] = None
 
     # Preload Silero VAD (model downloads on first run)
     try:
@@ -545,6 +576,7 @@ async def media_stream(ws: WebSocket, call_sid: str):
         "vad_mode": _cfg["vad_mode"],
         "stt_model_name": WHISPER_MODEL_SIZE,
         "use_silero": _cfg["vad_mode"] == "silero",
+        "opik": state.get("opik"),
     })
     await session.run()
 
@@ -588,6 +620,27 @@ _SUFFIX_EXCLUDE = (":audio", ":review", ":transcript", ":meta", ":live")
 def _call_record_keys(keys):
     """Filter Redis keys to actual call record hashes (exclude sub-keys)."""
     return [k for k in keys if not k.endswith(_SUFFIX_EXCLUDE)]
+
+
+@app.get("/api/stats")
+async def stats():
+    """True aggregate counts (not capped to the recent-20 list)."""
+    keys = _call_record_keys(await state["redis"].keys("call:*"))
+    total = len(keys)
+    completed = 0
+    total_dur = 0
+    for key in keys:
+        d = await state["redis"].hgetall(key)
+        if d.get("status") == "completed":
+            completed += 1
+        total_dur += int(d.get("duration_ms") or 0)
+    projects = len(await state["redis"].keys("project:*:rows"))
+    return {
+        "total_calls": total,
+        "completed": completed,
+        "projects": projects,
+        "total_duration_ms": total_dur,
+    }
 
 
 @app.get("/api/calls")
@@ -873,6 +926,9 @@ async def chat_with_llm(request: Request):
     except Exception as e:
         return JSONResponse({"error": f"LLM error: {e}"}, 500)
     llm_ms = (time.time() - llm_t0) * 1000
+
+    opik_span("chat.llm", {"messages": messages[-2:]},
+              reply_raw, {"type": "chat", "account_uid": account_uid, "llm_ms": llm_ms})
 
     # Track chat timing/config in the ACTIVE meta (never touches call records)
     await state["redis"].hincrbyfloat(meta_key, "llm_total_ms", llm_ms)
@@ -1386,7 +1442,7 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                            time.time() - call_start, account_uid, call_start,
                            tts_engine, vad_mode, system_prompt,
                            stt_total_ms, stt_count, llm_total_ms, llm_count,
-                           tts_total_ms, tts_count)
+                           sum(_tts_times), len(_tts_times))
 
     try:
         while True:
@@ -1446,18 +1502,21 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             llm_count += 1
             reply = resp.choices[0].message.content.strip()
             conversation.append({"role": "assistant", "content": reply})
+            opik_span("browser.llm", {"messages": conv[-2:]}, reply,
+                      {"type": "browser_call", "session_id": session_id,
+                       "account_uid": account_uid, "state": "browser", "llm_ms": llm_total_ms})
 
             # Retain [CALL_RESULT] JSON for downstream processing, don't speak it
             result = parse_call_result(reply)
             if result:
                 await state["redis"].hset(f"call:{session_id}", mapping={
-                    "claim_id": result.get("claim_id", "browser"),
-                    "payer": result.get("payer", "browser"),
-                    "status": result.get("status", "completed"),
-                    "next_action": result.get("next_action", ""),
-                    "denial_code": result.get("denial_code", ""),
-                    "paid_amount": str(result.get("paid_amount", "")),
-                    "call_summary": result.get("call_summary", ""),
+                    "claim_id": result.get("claim_id") or "browser",
+                    "payer": result.get("payer") or "browser",
+                    "status": result.get("status") or "completed",
+                    "next_action": result.get("next_action") or "",
+                    "denial_code": result.get("denial_code") or "",
+                    "paid_amount": str(result.get("paid_amount") or ""),
+                    "call_summary": result.get("call_summary") or "",
                     "call_result": reply,
                 })
 

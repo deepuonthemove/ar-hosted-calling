@@ -53,6 +53,7 @@ class CallSession:
         self.tts_engine = deps.get("tts_engine", "piper")
         self.vad_mode = deps.get("vad_mode", "silero" if self.use_silero else "rms")
         self.stt_model_name = deps.get("stt_model_name", "unknown")
+        self.opik = deps.get("opik")
 
         self.stream_sid: str | None = None
         self.full_audio = bytearray()
@@ -272,6 +273,17 @@ class CallSession:
             self.conversation.append({"role": "assistant", "content": bot_text})
             await self.redis.hset(f"call:{self.call_sid}", mapping={"last_llm_response": bot_text})
             await self._live_append({"role": "assistant", "text": strip_markers(bot_text)})
+            if self.opik:
+                try:
+                    self.opik.span(
+                        name="twilio.llm",
+                        input={"messages": self.conversation[-2:]},
+                        output=bot_text,
+                        metadata={"type": "twilio_call", "call_id": self.call_sid,
+                                  "state": self.state, "llm_ms": self.llm_total_ms},
+                    )
+                except Exception:
+                    pass
 
             parsed = parse_markers(bot_text)
 
@@ -607,10 +619,10 @@ class CallSession:
                 for key in ["payer", "claim_id", "next_action", "denial_code",
                             "paid_amount", "billed_amount", "appeal_deadline",
                             "call_summary", "satisfaction"]:
-                    if key in result:
+                    if key in result and result[key] is not None:
                         update[key] = str(result[key])
-                update["payer"] = result.get("payer", call_data.get("payer", "unknown"))
-                update["claim_id"] = result.get("claim_id", call_data.get("claim_id", "unknown"))
+                update["payer"] = result.get("payer") or call_data.get("payer", "unknown")
+                update["claim_id"] = result.get("claim_id") or call_data.get("claim_id", "unknown")
             # TTR metrics
             stt_avg = self.stt_total_ms / max(1, self.stt_count)
             llm_avg = self.llm_total_ms / max(1, self.llm_count)

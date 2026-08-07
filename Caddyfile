@@ -41,3 +41,10 @@
 		reverse_proxy frontend:3000
 	}
 }
+
+# Opik evaluation UI — separate hostname (optik.call.ar-voice.com → VM IP)
+optik.{$PUBLIC_DOMAIN} {
+	# Strip X-Frame-Options so the UI can be embedded in the feedback tab iframe
+	header -X-Frame-Options
+	reverse_proxy opik-frontend-1:5173
+}

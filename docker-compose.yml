@@ -136,8 +136,81 @@ services:
       - frontend
     profiles: [tls]
 
+  # ── Opik (LLM evaluation: tracing, playground, optimization) ─────────
+  # Run with: docker compose --profile opik up -d
+  # UI: http://<host>:5173 · API: http://<host>:8082
+  opik-redis:
+    image: redis:7-alpine
+    container_name: opik-redis
+    restart: unless-stopped
+    profiles: [opik]
+
+  opik-clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    container_name: opik-clickhouse
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: opik
+      CLICKHOUSE_USER: opik
+      CLICKHOUSE_PASSWORD: opik
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - opik-clickhouse:/var/lib/clickhouse
+    ulimits:
+      nofile: 262144
+      nproc: 8192
+      memlock: -1
+    profiles: [opik]
+
+  opik-backend:
+    image: ghcr.io/comet-ml/opik-backend:latest
+    container_name: opik-backend
+    restart: unless-stopped
+    ports:
+      - "8082:8080"  # remapped (8080 is used by voice-agent)
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://opik-backend:8080"
+      ANALYTICS_DB_DATABASE_NAME: opik
+      ANALYTICS_DB_USER: opik
+      ANALYTICS_DB_PASSWORD: opik
+      ANALYTICS_DB_HOST: opik-clickhouse
+      ANALYTICS_DB_PORT: 8123
+      REDIS_URL: redis://opik-redis:6379
+    depends_on:
+      - opik-clickhouse
+      - opik-redis
+    profiles: [opik]
+
+  opik-worker:
+    image: ghcr.io/comet-ml/opik-python-backend:latest
+    container_name: opik-worker
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://opik-redis:6379
+      CLICKHOUSE_URL: "http://opik:opik@opik-clickhouse:8123"
+      GRPC_SERVER_PORT: 8081
+    depends_on:
+      - opik-backend
+      - opik-clickhouse
+      - opik-redis
+    profiles: [opik]
+
+  opik-frontend:
+    image: ghcr.io/comet-ml/opik-frontend:latest
+    container_name: opik-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      OPIK_UI_OTEL_EXPORTER_OTLP_ENDPOINT: "http://opik-backend:8080"
+      OPIK_UI_SERVICE_PORT: 5173
+    depends_on:
+      - opik-backend
+    profiles: [opik]
+
 volumes:
   model-cache:
   redis-data:
   piper-models:
   caddy-data:
+  opik-clickhouse:

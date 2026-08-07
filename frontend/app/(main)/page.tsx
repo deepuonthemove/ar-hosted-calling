@@ -9,21 +9,23 @@ import { Badge } from "@/components/ui/badge";
 
 export default function DashboardPage() {
   const [calls, setCalls] = useState<CallRecord[]>([]);
-  const [projects, setProjects] = useState<Project[]>([]);
+  const [stats, setStats] = useState<{ total_calls: number; completed: number; projects: number; total_duration_ms: number }>({
+    total_calls: 0, completed: 0, projects: 0, total_duration_ms: 0,
+  });
   const [err, setErr] = useState("");
 
   useEffect(() => {
     const load = () => {
       api<CallRecord[]>("/api/calls").then(setCalls).catch((e) => setErr(String(e)));
-      api<Project[]>("/api/projects").then(setProjects).catch(() => {});
+      api("/api/stats").then(setStats).catch(() => {});
     };
     load();
     const t = setInterval(load, 5000); // auto-refresh
     return () => clearInterval(t);
   }, []);
 
-  const completed = calls.filter((c) => c.status === "completed").length;
-  const totalDur = calls.reduce((s, c) => s + (Number(c.duration_ms) || 0), 0);
+  const completed = stats.completed;
+  const totalDur = stats.total_duration_ms;
 
   // TTR averages (ms) across calls that have timing data
   const avg = (k: string) => {
@@ -56,9 +58,9 @@ export default function DashboardPage() {
       {err && <div className="text-sm text-red-600">{err}</div>}
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        {stat("Total Calls", String(calls.length), <Phone className="h-5 w-5 text-primary" />, "bg-primary/10")}
+        {stat("Total Calls", String(stats.total_calls), <Phone className="h-5 w-5 text-primary" />, "bg-primary/10")}
         {stat("Completed", String(completed), <CheckCircle2 className="h-5 w-5 text-green-600" />, "bg-green-600/10")}
-        {stat("Projects", String(projects.length), <FolderKanban className="h-5 w-5 text-amber-600" />, "bg-amber-500/10")}
+        {stat("Projects", String(stats.projects), <FolderKanban className="h-5 w-5 text-amber-600" />, "bg-amber-500/10")}
         {stat("Total Time", `${Math.round(totalDur / 60000)}m`, <Clock className="h-5 w-5 text-purple-600" />, "bg-purple-600/10")}
       </div>
 
