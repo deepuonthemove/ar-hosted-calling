@@ -39,6 +39,17 @@ export default function ProjectsPage() {
     }
   };
 
+  const onDelete = async (projectId: string) => {
+    if (!window.confirm(`Delete project ${projectId} and all its accounts & calls?`)) return;
+    try {
+      const d = await api(`/api/projects/${projectId}`, { method: "DELETE" });
+      setMsg({ ok: true, text: `Deleted ${projectId} (${d.deleted_accounts} accounts, ${d.deleted_calls} calls)` });
+      load();
+    } catch (err: any) {
+      setMsg({ ok: false, text: String(err) });
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div>
@@ -74,17 +85,26 @@ export default function ProjectsPage() {
           ) : (
             <div className="space-y-2">
               {projects.map((p) => (
-                <Link
+                <div
                   key={p.project_id}
-                  href={`/projects/${p.project_id}`}
                   className="flex items-center justify-between rounded-md border px-4 py-2.5 hover:bg-accent"
                 >
-                  <span className="font-mono text-sm">{p.project_id}</span>
-                  <div className="flex items-center gap-3">
-                    <Badge variant="secondary">{p.rows} rows</Badge>
-                    <Button size="sm" variant="ghost">Open →</Button>
-                  </div>
-                </Link>
+                  <Link href={`/projects/${p.project_id}`} className="flex flex-1 items-center justify-between">
+                    <span className="font-mono text-sm">{p.project_id}</span>
+                    <div className="flex items-center gap-3">
+                      <Badge variant="secondary">{p.rows} rows</Badge>
+                      <Button size="sm" variant="ghost">Open →</Button>
+                    </div>
+                  </Link>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="ml-3 text-red-600"
+                    onClick={() => onDelete(p.project_id)}
+                  >
+                    Delete
+                  </Button>
+                </div>
               ))}
             </div>
           )}

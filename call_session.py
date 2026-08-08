@@ -10,6 +10,7 @@ Port of src/do.ts with extensions:
 """
 import asyncio
 import base64
+import datetime
 import json
 import logging
 import os
@@ -28,6 +29,27 @@ from prompts import (
 log = logging.getLogger("call-session")
 
 _bg_tasks: set = set()  # strong refs for background tasks (avoids GC cancellation)
+
+
+def _opik_span(trace, name: str, span_type: str, input_data, output_data,
+               start_ts: float, end_ts: float, model: str | None = None):
+    """Create a COMPLETE span in a single call (no separate .end()).
+
+    Opik batches span messages; .end() shortly after creation drops the create
+    payload (name/type/start_time lost → epoch-0 timestamps). Passing measured
+    start/end + input/output up front avoids the race and yields real durations.
+    """
+    if trace is None:
+        return
+    try:
+        trace.span(
+            name=name, type=span_type, input=input_data, output=output_data,
+            start_time=datetime.datetime.fromtimestamp(start_ts, tz=datetime.timezone.utc),
+            end_time=datetime.datetime.fromtimestamp(end_ts, tz=datetime.timezone.utc),
+            model=model, provider="vllm" if span_type == "llm" else None,
+        )
+    except Exception:
+        pass
 
 MAX_SILENCE_MS = 19 * 60 * 1000
 HOLD_NUDGE_MS = 10000
@@ -54,6 +76,9 @@ class CallSession:
         self.vad_mode = deps.get("vad_mode", "silero" if self.use_silero else "rms")
         self.stt_model_name = deps.get("stt_model_name", "unknown")
         self.opik = deps.get("opik")
+        self._current_trace = None
+        self.peak_prompt_tokens = 0
+        self.total_completion_tokens = 0
 
         self.stream_sid: str | None = None
         self.full_audio = bytearray()
@@ -170,13 +195,46 @@ class CallSession:
             return
 
         await self._cancel_tts()
+
+        # Start the turn trace (thread = call) before STT
+        self._current_trace = None
+        if self.opik:
+            try:
+                self._current_trace = self.opik.trace(
+                    name="twilio.turn",
+                    input={"audio_sec": round(len(segment) / 16000, 2),
+                           "state": self.state},
+                    metadata={"type": "twilio_call", "call_id": self.call_sid},
+                    thread_id=self.call_sid, project_name="ar-voice-agent",
+                )
+            except Exception:
+                self._current_trace = None
+
+        stt_t0 = time.time()
         text = await self._transcribe(segment)
+        _opik_span(self._current_trace, "twilio.stt", "general",
+                   {"audio_sec": round(len(segment) / 16000, 2)}, {"text": text},
+                   stt_t0, time.time())
         if not text or len(text.strip()) < 3:
+            self._end_trace(output={"text": text, "status": "empty"})
             return
 
         log.info("[%s] Heard: %s", self.call_sid, text)
         await self._live_append({"role": "user", "text": text})
         await self._run_llm(text)
+
+    def _end_trace(self, output=None, error: str | None = None):
+        if self._current_trace is None:
+            return
+        try:
+            if error:
+                self._current_trace.end(output={"error": error},
+                                        error_info={"error_type": "error", "message": error})
+            else:
+                self._current_trace.end(output=output)
+        except Exception:
+            pass
+        self._current_trace = None
 
     # ── STT ──────────────────────────────────────────────────────────────
     async def _transcribe(self, audio: np.ndarray) -> str:
@@ -236,11 +294,16 @@ class CallSession:
                 max_tokens=200,
                 temperature=0,
                 stream=True,
+                stream_options={"include_usage": True},
             )
             bot_text = ""
+            usage = None
             sentence_buffer = ""
             seen_call_result = False
             async for chunk in stream:
+                if getattr(chunk, "usage", None):
+                    usage = chunk.usage
+                    continue
                 token = chunk.choices[0].delta.content or ""
                 bot_text += token
                 # Once the CALL_RESULT marker appears, stop speaking entirely
@@ -269,21 +332,18 @@ class CallSession:
 
             self.llm_total_ms += (time.time() - llm_t0) * 1000
             self.llm_count += 1
+            if usage is not None:
+                pt = int(getattr(usage, "prompt_tokens", 0) or 0)
+                ct = int(getattr(usage, "completion_tokens", 0) or 0)
+                self.peak_prompt_tokens = max(self.peak_prompt_tokens, pt)
+                self.total_completion_tokens += ct
             log.info("[%s] LLM (state=%s): %s", self.call_sid, self.state, bot_text)
             self.conversation.append({"role": "assistant", "content": bot_text})
             await self.redis.hset(f"call:{self.call_sid}", mapping={"last_llm_response": bot_text})
             await self._live_append({"role": "assistant", "text": strip_markers(bot_text)})
-            if self.opik:
-                try:
-                    self.opik.span(
-                        name="twilio.llm",
-                        input={"messages": self.conversation[-2:]},
-                        output=bot_text,
-                        metadata={"type": "twilio_call", "call_id": self.call_sid,
-                                  "state": self.state, "llm_ms": self.llm_total_ms},
-                    )
-                except Exception:
-                    pass
+            _opik_span(self._current_trace, "twilio.llm", "llm",
+                       {"messages": self.conversation[-2:]}, bot_text,
+                       llm_t0, time.time(), model=self.llm_model)
 
             parsed = parse_markers(bot_text)
 
@@ -322,14 +382,17 @@ class CallSession:
                 # Give Twilio time to flush/play the farewell audio before closing.
                 # Wait the full audio duration + a margin for Twilio's playback buffer.
                 await asyncio.sleep(max(1.5, self.last_tts_duration + 1.0))
+                self._end_trace(output={"call_result": call_result or {}, "status": "completed"})
                 await self._finalize("completed", result=call_result)
                 return
 
             # ── State machine transition ─────────────────────────────────
             self._advance_state(bot_text)
+            self._end_trace(output={"reply": bot_text, "state": self.state})
 
         except Exception as e:
             log.error("[%s] LLM error: %s", self.call_sid, e)
+            self._end_trace(error=str(e))
             await self.redis.hset(f"call:{self.call_sid}", mapping={"last_error": f"LLM: {e}"})
 
     # ── State Machine ────────────────────────────────────────────────────
@@ -470,6 +533,11 @@ class CallSession:
                         audio_started = True
                         self.tts_total_ms += (time.time() - tts_t0) * 1000
                         self.tts_count += 1
+                        _opik_span(self._current_trace, "twilio.tts", "general",
+                                   {"text": text[:120]},
+                                   {"audio_bytes": sent_samples * 2,
+                                    "latency_ms": round((time.time() - tts_t0) * 1000, 1)},
+                                   tts_t0, time.time())
                     await self.ws.send_text(json.dumps({
                         "event": "media",
                         "streamSid": self.stream_sid,
@@ -631,6 +699,9 @@ class CallSession:
             update["llm_avg_ms"] = str(int(llm_avg))
             update["tts_avg_ms"] = str(int(tts_avg))
             update["ttr_avg_ms"] = str(int(stt_avg + llm_avg + tts_avg))
+            update["peak_prompt_tokens"] = str(self.peak_prompt_tokens)
+            update["total_completion_tokens"] = str(self.total_completion_tokens)
+            update["context_limit"] = "4096"
             if error:
                 update["last_error"] = error
 

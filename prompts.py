@@ -85,6 +85,81 @@ Follow these rules strictly:
 Use the exact key names shown above — especially "status" (not claim_status), "claim_id" (not claimId), "next_action" (not appeal_process). Never output [CALL_RESULT] after only one or two exchanges. Never fabricate the status, codes, amounts, or dates — if you don't have a confirmed answer, ask for it instead of ending the call."""
 
 
+CLAIM_NOT_ON_FILE_PROCESS = """CLAIM NOT ON FILE VERIFICATION PROCESS
+
+1. Confirm Claim Status
+- Confirm that the claim is not available in the payer's system.
+- Ask whether the claim has ever been received and rejected at front-end.
+
+2. Verify Claim Search Criteria
+Request the representative to search using:
+- Member ID
+- Patient Name and DOB
+- Date(s) of Service (DOS)
+- Total Billed Amount
+- Claim Number (if available from the pre-call note)
+- Let the representative know about the submission method; Electronic, Paper, or Fax. (Pre-call analysis note should include these details)
+
+3. Details Needed for Resubmitting
+- Whether the patient and Member ID are active.
+- Policy coverage date.
+- Payer ID, mailing address, and fax number for claim submission.
+- Timely filing limit."""
+
+
+PAYMENT_VERIFICATION_PROCESS = """PAYMENT VERIFICATION PROCESS
+
+1. Confirm whether the claim has been fully paid.
+- If No, continue to Step 2.
+- If Yes, continue to Step 3.
+
+2. If the claim is partially paid, collect denial information for each denied CPT code:
+- CPT Code
+- Denial Reason & Remark Code (RARC), if available
+- Denial Description
+
+3. Collect payment information for each paid CPT code:
+- CPT Code
+- Allowed Amount
+- Paid Amount
+- Contractual adjustment amount
+- Patient Responsibility (Deductible, Coinsurance, Copay, etc.) // If no patient responsibility, don't ask this question for the remaining CPT codes.
+- Payment Method (after collecting split-up details of each CPT)
+
+PAYMENT METHOD
+
+1. If paid by Check:
+- Check number
+- Check issue date
+- Check amount
+- Mailing address where the check was sent to
+- Whether the check has been cashed
+- If yes, ask for the check cleared/encashed date
+- EOB copy through fax#
+- Check Tracer (if the check is lost or stale more than 30 days from issued date)
+
+2. If paid by EFT (Electronic Funds Transfer):
+- EFT Number
+- EFT date
+- EFT amount
+- EOB copy through fax#
+
+3. If paid by VCC (Virtual Credit Card):
+- VCC payment/reference/Draft number
+- Card issue date
+- Card expiration date (if applicable)
+- VCC amount
+- Mailing address or fax# where the VCC was sent to
+- Whether the VCC has been cashed
+- If yes, ask for the VCC cleared/encashed date
+- EOB copy through fax#
+- If yes, ask for the VCC expired date
+- Request the payment for reissuing in VCC or Check (if expired)
+
+IF CHECK OR VCC SENT TO THE WRONG ADDRESS
+The check/VCC was sent to the wrong mailing address. We provided the correct mailing address and requested that the payer void the uncashed payment and reissue it to the correct address. If the payer does not have the correct mailing address on file, ask for instructions on how to update the address, such as submitting an updated W-9 form or any other required documentation."""
+
+
 # ── Call Flow States ────────────────────────────────────────────────────
 STATES = [
     "GREETING",
@@ -193,11 +268,19 @@ def build_call_prompt(state: str, payer_knowledge: dict | None,
         parts.append(
             f"[CLAIM CONTEXT]\n"
             f"Patient: {account.get('Patient Name', account.get('patientName', 'unknown'))}\n"
+            f"Member ID: {account.get('Member ID', 'unknown')}\n"
+            f"DOB: {format_dos(account.get('DOB'))}\n"
             f"Date of Service: {format_dos(account.get('DOS', account.get('dos')))}\n"
             f"CPT: {account.get('CPT', account.get('cpt', 'unknown'))}\n"
             f"Billed: ${account.get('Billed Amount', account.get('billedAmount', '0'))}\n"
             f"Payer: {account.get('Responsible Payer', account.get('provider', 'unknown'))}\n"
             f"Account: {account.get('Account Number', account.get('accountNumber', 'unknown'))}\n"
+            f"Group: {account.get('Group Name', account.get('Group', 'unknown'))}\n"
+            f"Group NPI: {account.get('Group NPI', 'unknown')}\n"
+            f"Tax ID: {account.get('Tax ID', 'unknown')}\n"
+            f"Billing/Provider Address: {account.get('Billing/Provider Address', 'unknown')}\n"
+            f"Pay-to-address: {account.get('Pay-to-address', 'unknown')}\n"
+            f"Individual NPI: {account.get('Individual NPI', 'unknown')}\n"
             f"Objective: {account.get('AR Final Comments', 'Check claim status')}{denial_info}{notes_info}"
         )
 
@@ -236,6 +319,10 @@ def build_call_prompt(state: str, payer_knowledge: dict | None,
         lines.append(line)
     parts.append("[DENIAL CODES KNOWLEDGE BASE]")
     parts.append("\n".join(lines))
+
+    # Universal call workflows — always injected (all payers/claims)
+    parts.append("[CLAIM NOT ON FILE PROCESS]\n" + CLAIM_NOT_ON_FILE_PROCESS)
+    parts.append("[PAID CLAIM VERIFICATION PROCESS]\n" + PAYMENT_VERIFICATION_PROCESS)
 
     # Payer-specific likely codes (hint only, not exhaustive)
     if denial_code_subset:

@@ -21,6 +21,15 @@ export async function api<T = any>(path: string, opts?: RequestInit): Promise<T>
 export const wsUrl = (path: string) =>
   (API_BASE.startsWith("https") ? "wss" : "ws") + "://" + API_BASE.replace(/^https?:\/\//, "") + path;
 
+// Badge variant for a call/account status: paid/green, failed/red, dialing/amber, else gray.
+export const statusVariant = (status?: string) => {
+  const s = (status || "").toLowerCase();
+  if (s === "paid" || s === "completed") return "success" as const;
+  if (s === "failed" || s === "error") return "destructive" as const;
+  if (s === "dialing" || s === "in-progress") return "warning" as const;
+  return "secondary" as const;
+};
+
 export interface Project {
   project_id: string;
   rows: number;
@@ -39,6 +48,7 @@ export interface CallRecord {
   denial_code?: string;
   paid_amount?: string;
   last_error?: string;
+  call_result?: string;
 }
 
 export interface Account {

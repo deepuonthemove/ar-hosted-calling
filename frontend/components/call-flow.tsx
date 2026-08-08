@@ -68,7 +68,9 @@ export function CallFlow({ projectId, rowNum, accountUid, onActiveChange }: {
 
     ws.onopen = async () => {
       try {
-        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
         const ctx = new AudioContext({ sampleRate: MIC_RATE });
         src = ctx.createMediaStreamSource(micStream);
         proc = ctx.createScriptProcessor(CHUNK, 1, 1);

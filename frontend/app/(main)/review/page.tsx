@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { api, type CallRecord } from "@/lib/api";
+import { api, statusVariant, type CallRecord } from "@/lib/api";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Eye } from "lucide-react";
@@ -10,10 +10,20 @@ import { Eye } from "lucide-react";
 export default function ReviewPage() {
   const [calls, setCalls] = useState<CallRecord[]>([]);
   const [err, setErr] = useState("");
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [pages, setPages] = useState(1);
+  const limit = 15;
 
   useEffect(() => {
-    api<CallRecord[]>("/api/calls").then(setCalls).catch((e) => setErr(String(e)));
-  }, []);
+    api<{ calls: CallRecord[]; total: number; page: number; pages: number }>(`/api/calls?page=${page}&limit=${limit}`)
+      .then((d) => {
+        setCalls(d.calls);
+        setTotal(d.total);
+        setPages(d.pages);
+      })
+      .catch((e) => setErr(String(e)));
+  }, [page]);
 
   return (
     <div className="space-y-6">
@@ -26,7 +36,7 @@ export default function ReviewPage() {
       <Card>
         <CardHeader>
           <CardTitle>All Calls</CardTitle>
-          <CardDescription>{calls.length} calls total</CardDescription>
+          <CardDescription>{total} calls total · {limit} per page</CardDescription>
         </CardHeader>
         <CardContent>
           {calls.length === 0 ? (
@@ -53,7 +63,7 @@ export default function ReviewPage() {
                       <tr key={id} className="border-b last:border-0 hover:bg-accent">
                         <td className="p-2 font-mono text-xs">{id}</td>
                         <td className="p-2">
-                          <Badge variant={c.status === "completed" ? "success" : c.status === "dialing" ? "warning" : "secondary"}>
+                          <Badge variant={statusVariant(c.status)}>
                             {c.status}
                           </Badge>
                         </td>
@@ -76,6 +86,29 @@ export default function ReviewPage() {
               </table>
             </div>
           )}
+          <div className="mt-4 flex items-center justify-between">
+            <span className="text-xs text-muted-foreground">
+              Page {page} of {pages}
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={page <= 1}
+                className="rounded border px-3 py-1.5 text-xs disabled:opacity-40 hover:bg-accent"
+              >
+                Prev
+              </button>
+              <button
+                type="button"
+                onClick={() => setPage((p) => Math.min(pages, p + 1))}
+                disabled={page >= pages}
+                className="rounded border px-3 py-1.5 text-xs disabled:opacity-40 hover:bg-accent"
+              >
+                Next
+              </button>
+            </div>
+          </div>
         </CardContent>
       </Card>
     </div>

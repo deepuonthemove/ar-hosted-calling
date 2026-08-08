@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import time
+import datetime
 import uuid
 from urllib.parse import urlencode
 from contextlib import asynccontextmanager
@@ -77,13 +78,52 @@ state: dict = {}
 _bg_tasks: set = set()  # strong refs for background tasks (avoids GC cancellation)
 
 
-def opik_span(name: str, input_data, output_data, metadata: dict | None = None):
-    """Log a span to Opik (no-op if Opik is disabled/unavailable)."""
+def opik_span(trace, name: str, span_type: str, input_data, output_data,
+              start_ts: float | None = None, end_ts: float | None = None,
+              model: str | None = None, metadata: dict | None = None):
+    """Create a COMPLETE span in a single call (no separate .end()).
+
+    Opik batches span messages; calling span.end() shortly after creation can
+    drop the create payload (name/type/start_time lost → epoch-0 timestamps).
+    Measuring start/end ourselves and passing them with input+output up front
+    avoids that race entirely and yields a real duration.
+    """
+    if trace is None:
+        return None
+    try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        start = (datetime.datetime.fromtimestamp(start_ts, tz=datetime.timezone.utc)
+                 if start_ts is not None else now)
+        end = (datetime.datetime.fromtimestamp(end_ts, tz=datetime.timezone.utc)
+               if end_ts is not None else now)
+        return trace.span(name=name, type=span_type, input=input_data, output=output_data,
+                          start_time=start, end_time=end,
+                          model=model, provider="vllm" if span_type == "llm" else None,
+                          metadata=dict(metadata or {}))
+    except Exception:
+        return None
+
+
+def opik_start_trace(name: str, thread_id: str, input_data, metadata: dict | None = None):
+    """Start a trace grouped into a thread (one per call/chat session)."""
     client = state.get("opik")
     if not client:
+        return None
+    try:
+        return client.trace(name=name, input=input_data, metadata=metadata or {},
+                            thread_id=thread_id, project_name="ar-voice-agent")
+    except Exception:
+        return None
+
+
+def opik_end_trace(trace, output=None, error: str | None = None):
+    if trace is None:
         return
     try:
-        client.span(name=name, input=input_data, output=output_data, metadata=metadata or {})
+        if error:
+            trace.end(output={"error": error}, error_info={"error_type": "error", "message": error})
+        else:
+            trace.end(output=output)
     except Exception:
         pass
 
@@ -302,7 +342,8 @@ async def _save_review(session_id: str, conversation: list[dict], full_audio: by
                        tts_engine: str = "", vad_mode: str = "", system_prompt: str = "",
                        stt_total_ms: float = 0.0, stt_count: int = 0,
                        llm_total_ms: float = 0.0, llm_count: int = 0,
-                       tts_total_ms: float = 0.0, tts_count: int = 0):
+                       tts_total_ms: float = 0.0, tts_count: int = 0,
+                       peak_prompt_tokens: int = 0, total_completion_tokens: int = 0):
     """Save audio buffer, spawn offline STT, store review data."""
     r = state["redis"]
     audio_key = f"call:{session_id}:audio"
@@ -330,6 +371,9 @@ async def _save_review(session_id: str, conversation: list[dict], full_audio: by
         "ttr_avg_ms": str(int((stt_total_ms / max(1, stt_count))
                               + (llm_total_ms / max(1, llm_count))
                               + (tts_total_ms / max(1, tts_count)))),
+        "peak_prompt_tokens": str(peak_prompt_tokens),
+        "total_completion_tokens": str(total_completion_tokens),
+        "context_limit": "4096",
     })
 
     # Save audio to Redis (24h TTL)
@@ -622,6 +666,61 @@ def _call_record_keys(keys):
     return [k for k in keys if not k.endswith(_SUFFIX_EXCLUDE)]
 
 
+# ── Excel header mapping ─────────────────────────────────────────────────
+HEADER_ALIASES = {
+    # objective
+    "final comments": "AR Final Comments",
+    "ar final comments": "AR Final Comments",
+    # patient / demographics
+    "patient": "Patient Name",
+    "patient name": "Patient Name",
+    "patient's name": "Patient Name",
+    "member id": "Member ID",
+    "member": "Member ID",
+    "dob": "DOB",
+    "date of birth": "DOB",
+    "dos": "DOS",
+    "date of service": "DOS",
+    "cpt": "CPT",
+    "cpt code": "CPT",
+    "billed amount": "Billed Amount",
+    "billed": "Billed Amount",
+    "amount billed": "Billed Amount",
+    # payer / billing
+    "responsible party": "Responsible Payer",
+    "responsible payer": "Responsible Payer",
+    "payer": "Responsible Payer",
+    "account number": "Account Number",
+    "account #": "Account Number",
+    "claim id": "Claim ID",
+    "claim number": "Claim ID",
+    # group / provider
+    "group": "Group",
+    "group name": "Group Name",
+    "group npi": "Group NPI",
+    "tax id": "Tax ID",
+    "billing/provider address": "Billing/Provider Address",
+    "billing address": "Billing/Provider Address",
+    "provider address": "Billing/Provider Address",
+    "pay-to-address": "Pay-to-address",
+    "pay to address": "Pay-to-address",
+    "individual npi": "Individual NPI",
+    # workflow / outcome
+    "call status": "Call Status",
+    "status": "Call Status",
+    "denial code": "Denial Code",
+    "denial": "Denial Code",
+    "notes": "Notes",
+    "uid": "UID",
+}
+
+
+def _normalize_header(h: str) -> str:
+    """Map a source Excel header to the canonical field name (case-insensitive)."""
+    key = h.strip().lower()
+    return HEADER_ALIASES.get(key, h.strip())
+
+
 @app.get("/api/stats")
 async def stats():
     """True aggregate counts (not capped to the recent-20 list)."""
@@ -644,16 +743,28 @@ async def stats():
 
 
 @app.get("/api/calls")
-async def list_calls():
+async def list_calls(page: int | None = None, limit: int = 15):
     r = state["redis"]
     keys = _call_record_keys(await r.keys("call:*"))
     calls = []
-    for key in keys[:50]:
+    for key in keys:
         data = await r.hgetall(key)
         if data:
             calls.append({"callSid": key.replace("call:", ""), **data})
     calls.sort(key=lambda c: float(c.get("started_at", 0)), reverse=True)
-    return calls[:20]
+    if page is None:
+        return calls[:20]  # backward-compat for legacy /dashboard
+    limit = max(1, min(limit, 100))
+    page = max(1, page)
+    start = (page - 1) * limit
+    total = len(calls)
+    return {
+        "calls": calls[start:start + limit],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "pages": max(1, -(-total // limit)),
+    }
 
 
 @app.get("/export.csv")
@@ -765,7 +876,7 @@ async def upload_excel(file: UploadFile = File(...)):
         if not rows:
             return JSONResponse({"error": "Sheet is empty"}, 400)
 
-        headers = [str(h) if h else f"col_{i}" for i, h in enumerate(rows[0])]
+        headers = [_normalize_header(str(h) if h else f"col_{i}") for i, h in enumerate(rows[0])]
         r = state["redis"]
 
         # Generate a unique project id for this upload
@@ -777,6 +888,7 @@ async def upload_excel(file: UploadFile = File(...)):
             for j, val in enumerate(row):
                 if j < len(headers) and val is not None:
                     record[headers[j]] = val.isoformat() if hasattr(val, "isoformat") else str(val)
+            # "Final Comments" → objective (AR Final Comments) is handled by HEADER_ALIASES
             uid = record.get("UID") or f"{project_id}-{i}-{int(time.time())}"
             record["UID"] = uid
             record.setdefault("Call Status", "Pending")
@@ -819,6 +931,40 @@ async def list_projects():
         projects.append({"project_id": pid, "rows": count})
     projects.sort(key=lambda p: p["project_id"], reverse=True)
     return projects
+
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str):
+    """Delete a project: its metadata, accounts, and the call records they own."""
+    r = state["redis"]
+    raw = await r.get(f"project:{project_id}:rows")
+    if not raw:
+        return JSONResponse({"error": f"Project {project_id} not found"}, 404)
+    uids = json.loads(raw)
+    uid_set = set(uids)
+
+    await r.delete(f"project:{project_id}:rows", f"project:{project_id}:headers")
+
+    for uid in uids:
+        await r.delete(f"account:{uid}")
+        await r.delete(f"account:{uid}:llm_context")
+        await r.delete(f"account:{uid}:active")
+        await r.delete(f"account:{uid}:active:meta")
+
+    # Remove call records (and sub-keys) that belong to this project's accounts
+    call_keys = await r.keys("call:*")
+    base_keys = _call_record_keys(call_keys)
+    deleted_calls = 0
+    for key in base_keys:
+        data = await r.hgetall(key)
+        if data.get("account_uid") in uid_set:
+            base = key.replace("call:", "")
+            await r.delete(key)
+            for suffix in (":audio", ":review", ":transcript", ":meta", ":live"):
+                await r.delete(f"call:{base}{suffix}")
+            deleted_calls += 1
+
+    return {"ok": True, "deleted_accounts": len(uids), "deleted_calls": deleted_calls}
 
 
 @app.get("/api/projects/{project_id}/accounts")
@@ -918,17 +1064,27 @@ async def chat_with_llm(request: Request):
         messages.append({"role": t["role"], "content": t["text"]})
     messages.append({"role": "user", "content": message})
 
+    trace = opik_start_trace("chat.turn", f"chat:{account_uid}",
+                             {"messages": messages[-2:]},
+                             {"type": "chat", "account_uid": account_uid})
+
     llm_t0 = time.time()
     try:
         resp = await state["llm_client"].chat.completions.create(
             model=state["llm_model"], messages=messages, max_tokens=300, temperature=0)
         reply_raw = resp.choices[0].message.content.strip()
     except Exception as e:
+        opik_end_trace(trace, error=str(e))
         return JSONResponse({"error": f"LLM error: {e}"}, 500)
     llm_ms = (time.time() - llm_t0) * 1000
 
-    opik_span("chat.llm", {"messages": messages[-2:]},
-              reply_raw, {"type": "chat", "account_uid": account_uid, "llm_ms": llm_ms})
+    _chat_usage = getattr(resp, "usage", None)
+    opik_span(trace, "chat.llm", "llm", {"messages": messages[-2:]}, reply_raw,
+              llm_t0, time.time(), model=state["llm_model"],
+              metadata={"usage": {"prompt_tokens": getattr(_chat_usage, "prompt_tokens", None),
+                                  "completion_tokens": getattr(_chat_usage, "completion_tokens", None),
+                                  "total_tokens": getattr(_chat_usage, "total_tokens", None)}} if _chat_usage else None)
+    opik_end_trace(trace, output=reply_raw)
 
     # Track chat timing/config in the ACTIVE meta (never touches call records)
     await state["redis"].hincrbyfloat(meta_key, "llm_total_ms", llm_ms)
@@ -1407,6 +1563,8 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
     stt_count = 0
     llm_total_ms = 0.0
     llm_count = 0
+    peak_prompt_tokens = 0
+    total_completion_tokens = 0
     tts_total_ms = 0.0
     tts_count = 0
 
@@ -1415,6 +1573,7 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
     conversation.append({"role": "assistant", "content": greeting})
     await ws.send_json({"type": "llm_text", "text": greeting})
     tts_task = asyncio.create_task(_stream_tts_reply(ws, greeting, tts_fn, _tts_times))
+    greeting_task = tts_task
 
     vad = VAD(use_silero=use_silero)
     barge_in = False
@@ -1442,7 +1601,8 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                            time.time() - call_start, account_uid, call_start,
                            tts_engine, vad_mode, system_prompt,
                            stt_total_ms, stt_count, llm_total_ms, llm_count,
-                           sum(_tts_times), len(_tts_times))
+                           sum(_tts_times), len(_tts_times),
+                           peak_prompt_tokens, total_completion_tokens)
 
     try:
         while True:
@@ -1455,15 +1615,17 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             # If energy spikes while TTS is playing → possible barge-in
             # Cooldown (1.2s) prevents echo from the cancelled TTS re-triggering
             # a reset that discards the user's ongoing speech.
-            if (tts_task and not tts_task.done() and energy > 0.025
-                    and now - last_barge_in > 1.2):
+            # NOTE: barge-in is disabled while the GREETING is playing — speaker
+            # echo/ambient noise must not cancel the very first message.
+            if (tts_task and not tts_task.done() and tts_task is not greeting_task
+                    and energy > 0.025 and now - last_barge_in > 1.2):
                 await cancel_tts()
                 last_barge_in = now
                 barge_in = True
                 await ws.send_bytes(b"\x02")
-                # Skip this chunk — it's likely echo from the TTS we just cancelled
-                # Reset VAD to avoid processing leftover echo
-                vad = VAD(use_silero=use_silero)
+                # Skip this chunk — it's likely echo from the TTS we just cancelled.
+                # Do NOT reset the VAD (matches Twilio): the caller's ongoing speech
+                # must keep accumulating so it can be flushed and understood.
                 continue
 
             segment = vad.add(audio, now)
@@ -1473,19 +1635,30 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             await cancel_tts()
             barge_in = False
 
+            _trace = opik_start_trace("browser.turn", session_id,
+                                      {"audio_sec": round(len(segment) / 16000, 2)},
+                                      {"type": "browser_call", "session_id": session_id,
+                                       "account_uid": account_uid, "state": "browser"})
+
+            _stt_t0 = time.time()
             async with state["stt_lock"]:
                 loop = asyncio.get_running_loop()
-                t0 = time.time()
                 segs, _ = await loop.run_in_executor(
                     None, lambda: state["stt_model"].transcribe(segment, beam_size=1, vad_filter=True))
-                stt_total_ms += (time.time() - t0) * 1000
+                stt_latency_ms = (time.time() - _stt_t0) * 1000
+                stt_total_ms += stt_latency_ms
                 stt_count += 1
                 text = " ".join(s.text for s in segs).strip()
+            opik_span(_trace, "browser.stt", "general",
+                      {"audio_sec": round(len(segment) / 16000, 2)}, {"text": text},
+                      _stt_t0, time.time())
             if len(text) < 3:
+                opik_end_trace(_trace, output={"text": text, "status": "empty"})
                 continue
 
             if _is_end_of_call(text, conversation):
                 await cancel_tts()
+                opik_end_trace(_trace, output={"status": "end_of_call"})
                 await ws.send_json({"type": "llm_text", "text": "Call ended. Have a great day!"})
                 await _finalize_review()
                 await asyncio.sleep(1)
@@ -1495,16 +1668,26 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             conversation.append({"role": "user", "content": f"[INSURANCE REP] {text}"})
             await ws.send_json({"type": "transcript", "text": text})
             conv = conversation if len(conversation) <= 15 else [conversation[0]] + conversation[-14:]
-            t0 = time.time()
-            resp = await state["llm_client"].chat.completions.create(
-                model=state["llm_model"], messages=conv, max_tokens=150, temperature=0)
-            llm_total_ms += (time.time() - t0) * 1000
+            _llm_t0 = time.time()
+            try:
+                resp = await state["llm_client"].chat.completions.create(
+                    model=state["llm_model"], messages=conv, max_tokens=150, temperature=0)
+            except Exception as _e:
+                opik_end_trace(_trace, error=str(_e))
+                raise
+            llm_total_ms += (time.time() - _llm_t0) * 1000
             llm_count += 1
             reply = resp.choices[0].message.content.strip()
             conversation.append({"role": "assistant", "content": reply})
-            opik_span("browser.llm", {"messages": conv[-2:]}, reply,
-                      {"type": "browser_call", "session_id": session_id,
-                       "account_uid": account_uid, "state": "browser", "llm_ms": llm_total_ms})
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                peak_prompt_tokens = max(peak_prompt_tokens, int(getattr(usage, "prompt_tokens", 0) or 0))
+                total_completion_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
+            opik_span(_trace, "browser.llm", "llm", {"messages": conv[-2:]}, reply,
+                      _llm_t0, time.time(), model=state["llm_model"],
+                      metadata={"usage": {"prompt_tokens": getattr(usage, "prompt_tokens", None),
+                                          "completion_tokens": getattr(usage, "completion_tokens", None),
+                                          "total_tokens": getattr(usage, "total_tokens", None)}} if usage else None)
 
             # Retain [CALL_RESULT] JSON for downstream processing, don't speak it
             result = parse_call_result(reply)
@@ -1526,7 +1709,7 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                 await cancel_tts()
                 farewell = "Okay, thank you. Goodbye!"
                 await ws.send_json({"type": "llm_text", "text": farewell})
-                tts_task = asyncio.create_task(_stream_tts_reply(ws, farewell, tts_fn, _tts_times))
+                tts_task = asyncio.create_task(_stream_tts_reply(ws, farewell, tts_fn, _tts_times, trace=_trace))
                 if tts_task:
                     try:
                         await asyncio.wait_for(tts_task, timeout=10)
@@ -1536,6 +1719,7 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                         log.warning("[%s] Farewell TTS timed out — ending anyway", session_id)
                     except Exception:
                         pass
+                opik_end_trace(_trace, output={"status": "completed", "call_result": result})
                 await _finalize_review()
                 await asyncio.sleep(1)
                 try:
@@ -1549,7 +1733,8 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             await ws.send_json({"type": "llm_text", "text": spoken})
 
             # Stream TTS in background so audio reads continue
-            tts_task = asyncio.create_task(_stream_tts_reply(ws, spoken, tts_fn, _tts_times))
+            tts_task = asyncio.create_task(_stream_tts_reply(ws, spoken, tts_fn, _tts_times, trace=_trace))
+            asyncio.create_task(_end_browser_trace_after_tts(tts_task, _trace, {"reply": spoken}))
 
     except Exception:
         pass
@@ -1563,15 +1748,37 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                 pass
 
 
-async def _stream_tts_reply(ws: WebSocket, text: str, tts_fn=tts_stream, tts_times: list | None = None):
+async def _end_browser_trace_after_tts(tts_task, trace, output):
+    """End the turn trace after the background TTS (and its span) completes."""
+    if trace is None:
+        return
+    try:
+        await tts_task
+    except Exception:
+        pass
+    opik_end_trace(trace, output=output)
+
+
+async def _stream_tts_reply(ws: WebSocket, text: str, tts_fn=tts_stream, tts_times: list | None = None,
+                            trace=None):
     t0 = time.time()
     first = True
+    total_bytes = 0
     try:
         async for pcm_bytes in tts_fn(text):
             if first and tts_times is not None:
                 tts_times.append((time.time() - t0) * 1000)
                 first = False
+            total_bytes += len(pcm_bytes)
             await ws.send_bytes(b"\x01" + pcm_bytes)
+            if first is False and trace is not None:
+                opik_span(trace, "browser.tts", "general", {"text": text[:120]},
+                          {"audio_bytes": total_bytes, "latency_ms": round((time.time() - t0) * 1000, 1)},
+                          t0, time.time())
+                trace = None
+        if trace is not None:
+            opik_span(trace, "browser.tts", "general", {"text": text[:120]},
+                      {"audio_bytes": total_bytes}, t0, time.time())
     except asyncio.CancelledError:
         pass
     except Exception as e:

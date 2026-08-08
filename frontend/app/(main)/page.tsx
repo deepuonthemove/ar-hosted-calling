@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Phone, CheckCircle2, FolderKanban, Clock, Gauge } from "lucide-react";
-import { api, type CallRecord, type Project } from "@/lib/api";
+import { api, statusVariant, type CallRecord, type Project } from "@/lib/api";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 
@@ -16,7 +16,7 @@ export default function DashboardPage() {
 
   useEffect(() => {
     const load = () => {
-      api<CallRecord[]>("/api/calls").then(setCalls).catch((e) => setErr(String(e)));
+      api<{ calls: CallRecord[] }>("/api/calls?page=1&limit=10").then((d) => setCalls(d.calls)).catch((e) => setErr(String(e)));
       api("/api/stats").then(setStats).catch(() => {});
     };
     load();
@@ -113,7 +113,6 @@ export default function DashboardPage() {
             <div className="space-y-2">
               {calls.slice(0, 10).map((c) => {
                 const id = c.call_id || c.callSid || "";
-                const statusOk = c.status === "completed";
                 return (
                   <Link
                     key={id}
@@ -121,7 +120,7 @@ export default function DashboardPage() {
                     className="flex items-center justify-between rounded-md border px-4 py-2.5 hover:bg-accent"
                   >
                     <div className="flex items-center gap-3">
-                      <Badge variant={statusOk ? "success" : c.status === "dialing" ? "warning" : "secondary"}>
+                      <Badge variant={statusVariant(c.status)}>
                         {c.status}
                       </Badge>
                       <span className="font-mono text-xs text-muted-foreground">{id}</span>

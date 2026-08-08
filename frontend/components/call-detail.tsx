@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { api, type CallDetail } from "@/lib/api";
+import { api, statusVariant, type CallDetail } from "@/lib/api";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { ArrowLeft, ChevronDown } from "lucide-react";
@@ -40,7 +40,6 @@ export function CallDetail({ callId }: { callId: string }) {
   if (!detail) return <div className="text-sm text-muted-foreground">Loading call...</div>;
 
   const c = detail.call;
-  const statusOk = c.status === "completed";
 
   return (
     <div className="space-y-6">
@@ -49,7 +48,7 @@ export function CallDetail({ callId }: { callId: string }) {
       </Link>
       <div className="flex items-center gap-3">
         <h1 className="text-2xl font-bold font-mono">{callId}</h1>
-        <Badge variant={statusOk ? "success" : c.status === "dialing" ? "warning" : "secondary"}>{c.status}</Badge>
+        <Badge variant={statusVariant(c.status)}>{c.status}</Badge>
         {detail.twilio_sid && <span className="text-xs text-muted-foreground font-mono">Twilio: {detail.twilio_sid}</span>}
       </div>
 
@@ -127,6 +126,14 @@ export function CallDetail({ callId }: { callId: string }) {
             <div>
               <dt className="text-xs text-muted-foreground">TTS (first byte)</dt>
               <dd>{c.tts_avg_ms ? `${Math.round(Number(c.tts_avg_ms))}ms` : "—"}</dd>
+            </div>
+            <div>
+              <dt className="text-xs text-muted-foreground">Context (peak / limit)</dt>
+              <dd>{c.peak_prompt_tokens ? `${Number(c.peak_prompt_tokens).toLocaleString()} / ${c.context_limit || "4096"}` : "—"}</dd>
+            </div>
+            <div>
+              <dt className="text-xs text-muted-foreground">Completion tokens</dt>
+              <dd>{c.total_completion_tokens ? `${Number(c.total_completion_tokens).toLocaleString()}` : "—"}</dd>
             </div>
           </dl>
         </CardContent>

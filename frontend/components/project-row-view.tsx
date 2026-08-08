@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { api, type CallRecord } from "@/lib/api";
+import { api, statusVariant, type CallRecord } from "@/lib/api";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -16,6 +16,7 @@ import { ArrowLeft, PlusCircle } from "lucide-react";
 export function ProjectRowView({ projectId, rowNum }: { projectId: string; rowNum: number }) {
   const [acct, setAcct] = useState<any>(null);
   const [history, setHistory] = useState<CallRecord[]>([]);
+  const [lastResult, setLastResult] = useState<{ callId: string; result: Record<string, string> } | null>(null);
   const [note, setNote] = useState("");
   const [err, setErr] = useState("");
   const [callActive, setCallActive] = useState(false);
@@ -31,12 +32,29 @@ export function ProjectRowView({ projectId, rowNum }: { projectId: string; rowNu
     } catch {}
   };
 
+  // Last completed outcome: most recent call that produced a [CALL_RESULT].
+  const applyHistory = (calls: CallRecord[]) => {
+    setHistory(calls);
+    for (const c of calls) {
+      if (c.call_result) {
+        const m = c.call_result.match(/\{[\s\S]*\}/);
+        if (m) {
+          try {
+            setLastResult({ callId: c.call_id || c.callSid || "", result: JSON.parse(m[0]) });
+            return;
+          } catch {}
+        }
+      }
+    }
+    setLastResult(null);
+  };
+
   const load = async () => {
     try {
       const d = await api<{ account_uid: string; account: any }>(`/api/projects/${projectId}/accounts/${rowNum}`);
       setAcct(d.account);
       uidRef.current = d.account_uid;
-      api<CallRecord[]>(`/api/accounts/${d.account_uid}/calls`).then(setHistory).catch(() => {});
+      api<CallRecord[]>(`/api/accounts/${d.account_uid}/calls`).then(applyHistory).catch(() => {});
       loadChatHistory();
     } catch (e: any) { setErr(String(e)); }
   };
@@ -49,12 +67,20 @@ export function ProjectRowView({ projectId, rowNum }: { projectId: string; rowNu
       if (uidRef.current) {
         try {
           const h = await api<CallRecord[]>(`/api/accounts/${uidRef.current}/calls`);
-          setHistory(h);
+          applyHistory(h);
         } catch {}
       }
     }, 4000);
     return () => clearInterval(t);
   }, [callActive]);
+
+  // When a call ends (active true→false) polling stops, so do one final refresh
+  // to pick up the just-written call record immediately.
+  const handleActiveChange = (active: boolean) => {
+    const wasActive = callActive;
+    setCallActive(active);
+    if (!active && wasActive) load();
+  };
 
   const addNote = async () => {
     if (!note.trim()) return;
@@ -69,12 +95,20 @@ export function ProjectRowView({ projectId, rowNum }: { projectId: string; rowNu
 
   const fields = [
     ["Patient Name", acct["Patient Name"]],
-    ["Date of Service", acct["DOS"]],
+    ["Member ID", acct["Member ID"]],
+    ["DOB", acct["DOB"]],
+    ["DOS", acct["DOS"]],
     ["CPT", acct["CPT"]],
     ["Billed Amount", acct["Billed Amount"]],
     ["Responsible Payer", acct["Responsible Payer"]],
     ["Account Number", acct["Account Number"]],
     ["Claim ID", acct["Claim ID"]],
+    ["Group", acct["Group Name"] || acct["Group"]],
+    ["Group NPI", acct["Group NPI"]],
+    ["Tax ID", acct["Tax ID"]],
+    ["Billing/Provider Address", acct["Billing/Provider Address"]],
+    ["Pay-to-address", acct["Pay-to-address"]],
+    ["Individual NPI", acct["Individual NPI"]],
     ["AR Final Comments", acct["AR Final Comments"]],
     ["Call Status", acct["Call Status"]],
     ["Denial Code", acct["Denial Code"]],
@@ -110,6 +144,37 @@ export function ProjectRowView({ projectId, rowNum }: { projectId: string; rowNu
               </dl>
             </CardContent>
           </Card>
+
+          {lastResult && (
+            <Card>
+              <CardHeader>
+                <CardTitle>Call Result</CardTitle>
+                <CardDescription>
+                  Latest outcome
+                  {lastResult.callId && (
+                    <>
+                      {" · "}
+                      <Link href={`/calls/${lastResult.callId}`} className="text-primary hover:underline">
+                        view call →
+                      </Link>
+                    </>
+                  )}
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm">
+                  {Object.entries(lastResult.result)
+                    .filter(([, v]) => v !== null && v !== undefined && String(v) !== "" && String(v).toLowerCase() !== "null")
+                    .map(([k, v]) => (
+                      <div key={k} className={k === "call_summary" ? "col-span-2" : ""}>
+                        <dt className="text-xs text-muted-foreground capitalize">{k.replace(/_/g, " ")}</dt>
+                        <dd className="font-medium">{String(v)}</dd>
+                      </div>
+                    ))}
+                </dl>
+              </CardContent>
+            </Card>
+          )}
 
           <Card>
             <CardHeader>
@@ -161,7 +226,7 @@ export function ProjectRowView({ projectId, rowNum }: { projectId: string; rowNu
             <CardContent className="pt-4">
               {tabActive === "call" ? (
                 <div className="space-y-6">
-                  <CallFlow projectId={projectId} rowNum={rowNum} accountUid={acct["UID"] || ""} onActiveChange={setCallActive} />
+                  <CallFlow projectId={projectId} rowNum={rowNum} accountUid={acct["UID"] || ""} onActiveChange={handleActiveChange} />
 
                   <div>
                     <div className="mb-2 text-sm font-semibold">Call History</div>
@@ -174,7 +239,7 @@ export function ProjectRowView({ projectId, rowNum }: { projectId: string; rowNu
                           return (
                             <Link key={id} href={`/calls/${id}`} className="flex items-center justify-between rounded-md border px-3 py-2 hover:bg-accent">
                               <div className="flex items-center gap-2">
-                                <Badge variant={c.status === "completed" ? "success" : "secondary"}>{c.status}</Badge>
+                                <Badge variant={statusVariant(c.status)}>{c.status}</Badge>
                                 <span className="font-mono text-xs">{id}</span>
                               </div>
                               <div className="text-xs text-muted-foreground">
