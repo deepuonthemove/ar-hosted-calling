@@ -29,7 +29,7 @@ from faster_whisper import WhisperModel
 from openai import AsyncOpenAI
 from openpyxl import load_workbook, Workbook
 
-from audio import VAD, twilio_to_whisper, piper_to_twilio, rms
+from audio import VAD, twilio_to_whisper, piper_to_twilio, rms, transcribe_live, transcribe_offline
 from call_session import CallSession
 from prompts import build_call_prompt, parse_markers, parse_call_result, build_greeting, load_payer, load_denial_codes, attempt_repair, strip_markers, format_dos
 
@@ -55,13 +55,14 @@ PIPER_VOICE = os.getenv("PIPER_VOICE", "en_US-lessac-medium")
 PIPER_RATE = int(os.getenv("PIPER_SAMPLE_RATE", "22050"))
 PIPER_DATA_DIR = os.getenv("PIPER_DATA_DIR", "/models/piper")
 # >1.0 = slower (length-scale), 1.0 = normal
-PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.12"))
+PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.35"))
 
 TTS_ENGINE = os.getenv("TTS_ENGINE", "piper")
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_bella")
 KOKORO_RATE = 24000
 # <1.0 = slower (speed), 1.0 = normal
-KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "0.9"))
+KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "0.81"))
+KOKORO_DEVICE = os.getenv("KOKORO_DEVICE", "cuda")
 
 VAD_MODE = os.getenv("VAD_MODE", "silero")  # "rms" or "silero"
 
@@ -148,8 +149,14 @@ def load_models():
 
     try:
         from kokoro import KPipeline
-        state["kokoro_pipeline"] = KPipeline(lang_code='a', device='cpu')
-        log.info("Kokoro TTS loaded (voice=%s)", KOKORO_VOICE)
+        state["kokoro_pipeline"] = KPipeline(lang_code='a', device=KOKORO_DEVICE)
+        log.info("Kokoro TTS loaded (voice=%s, device=%s)", KOKORO_VOICE, KOKORO_DEVICE)
+        # Warm up the voice + CUDA at startup so the FIRST real synthesis is
+        # never delayed by a lazy voice download / GPU init.
+        try:
+            _ = list(state["kokoro_pipeline"]("Hello.", voice=KOKORO_VOICE, speed=KOKORO_SPEED))
+        except Exception as we:
+            log.warning("Kokoro warmup failed: %s", we)
     except Exception as e:
         log.warning("Kokoro not available, will fall back to Piper: %s", e)
         state["kokoro_pipeline"] = None
@@ -183,18 +190,18 @@ def load_models():
 
 
 # ── TTS text preprocessing ───────────────────────────────────────────────
-_NUM_ID_RE = re.compile(r"\d{5,}")
-_DATE_RE = re.compile(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?)?)\b")
+# Engine-specific transforms live in tts_piper.py / tts_kokoro.py (shared
+# logic in tts_common.py) because Piper and Kokoro honor punctuation pauses
+# differently.
+import tts_piper as _tts_piper_mod
+import tts_kokoro as _tts_kokoro_mod
+
+_TTS_MODS = {"piper": _tts_piper_mod, "kokoro": _tts_kokoro_mod}
 
 
-def tts_text(text: str) -> str:
-    """Preprocess text for TTS:
-    - Format dates (02/12/2026 -> 12th February 2026)
-    - Read long digit runs digit-by-digit (claim/account/phone numbers)
-    Short numbers (amounts like 276, years like 2026) keep normal reading.
-    """
-    text = _DATE_RE.sub(lambda m: format_dos(m.group(1)), text)
-    return _NUM_ID_RE.sub(lambda m: " ".join(m.group()), text)
+def tts_text(text: str, engine: str = "piper") -> str:
+    """Preprocess text for TTS using the engine-specific transform module."""
+    return _TTS_MODS.get(engine, _tts_piper_mod).tts_text(text)
 
 
 def _piper_next(gen):
@@ -219,7 +226,7 @@ async def _get_tts_lock():
 
 # ── Piper TTS streaming ──────────────────────────────────────────────────
 async def tts_stream(text: str):
-    text = tts_text(text)
+    text = tts_text(text, "piper")
     voice = state.get("piper_voice")
     if voice is not None:
         # Persistent in-process model — first audio in ~0.1s (vs ~1.8s subprocess)
@@ -267,9 +274,21 @@ async def tts_stream(text: str):
 
 
 # ── Kokoro TTS streaming ────────────────────────────────────────────────
+# Serializes in-process Kokoro synthesis (single KPipeline, not thread-safe
+# under concurrent calls).
+_kokoro_lock = None
+
+
+async def _get_kokoro_lock():
+    global _kokoro_lock
+    if _kokoro_lock is None:
+        _kokoro_lock = asyncio.Lock()
+    return _kokoro_lock
+
+
 async def kokoro_stream(text: str):
     from audio import resample
-    text = tts_text(text)
+    text = tts_text(text, "kokoro")
     pipeline = state.get("kokoro_pipeline")
     if not pipeline:
         log.warning("Kokoro not loaded, falling back to Piper")
@@ -277,21 +296,25 @@ async def kokoro_stream(text: str):
             yield chunk
         return
     loop = asyncio.get_running_loop()
+    lock = await _get_kokoro_lock()
     try:
-        results = await loop.run_in_executor(
-            None, lambda: list(pipeline(text, voice=KOKORO_VOICE, speed=KOKORO_SPEED))
-        )
+        # Stream segment-by-segment (do NOT list() the whole pipeline — that
+        # forces the full synthesis before any audio, causing long silence).
+        async with lock:
+            gen = pipeline(text, voice=KOKORO_VOICE, speed=KOKORO_SPEED)
+            while True:
+                result = await loop.run_in_executor(None, _piper_next, gen)
+                if result is None:
+                    break
+                if result.audio is None or len(result.audio) == 0:
+                    continue
+                audio = result.audio
+                if KOKORO_RATE != PIPER_RATE:
+                    audio = resample(audio, KOKORO_RATE, PIPER_RATE)
+                pcm = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+                yield pcm.tobytes()
     except Exception as e:
         log.error("Kokoro TTS error: %s", e)
-        return
-    for result in results:
-        if result.audio is None or len(result.audio) == 0:
-            continue
-        audio = result.audio
-        if KOKORO_RATE != PIPER_RATE:
-            audio = resample(audio, KOKORO_RATE, PIPER_RATE)
-        pcm = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
-        yield pcm.tobytes()
 
 
 def get_tts_fn(engine: str):
@@ -329,12 +352,9 @@ async def transcribe_full_audio(audio_bytes: bytes) -> str:
     pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
     async with state["stt_lock"]:
         loop = asyncio.get_running_loop()
-        segments, _ = await loop.run_in_executor(
-            None, lambda: state["stt_model"].transcribe(
-                pcm, beam_size=5, vad_filter=False, language="en"
-            ),
+        return await loop.run_in_executor(
+            None, lambda: transcribe_offline(state["stt_model"], pcm)
         )
-        return " ".join(s.text for s in segments).strip()
 
 
 async def _save_review(session_id: str, conversation: list[dict], full_audio: bytes,
@@ -1573,11 +1593,9 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
     conversation.append({"role": "assistant", "content": greeting})
     await ws.send_json({"type": "llm_text", "text": greeting})
     tts_task = asyncio.create_task(_stream_tts_reply(ws, greeting, tts_fn, _tts_times))
-    greeting_task = tts_task
 
     vad = VAD(use_silero=use_silero)
     barge_in = False
-    last_barge_in = 0.0
     full_audio = bytearray()
     call_start = time.time()
     review_saved = False
@@ -1610,24 +1628,13 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             full_audio.extend(raw)
             audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
             now = time.time()
-            energy = rms(audio)
 
-            # If energy spikes while TTS is playing → possible barge-in
-            # Cooldown (1.2s) prevents echo from the cancelled TTS re-triggering
-            # a reset that discards the user's ongoing speech.
-            # NOTE: barge-in is disabled while the GREETING is playing — speaker
-            # echo/ambient noise must not cancel the very first message.
-            if (tts_task and not tts_task.done() and tts_task is not greeting_task
-                    and energy > 0.025 and now - last_barge_in > 1.2):
-                await cancel_tts()
-                last_barge_in = now
-                barge_in = True
-                await ws.send_bytes(b"\x02")
-                # Skip this chunk — it's likely echo from the TTS we just cancelled.
-                # Do NOT reset the VAD (matches Twilio): the caller's ongoing speech
-                # must keep accumulating so it can be flushed and understood.
-                continue
-
+            # NOTE: no raw-energy barge-in. The speaker echo of the bot's own
+            # TTS frequently exceeded the energy threshold and cancelled
+            # replies before they were heard. Interrupts happen only through
+            # the VAD segment flush below (Silero distinguishes real speech
+            # from the bot's own voice), which still cancels the TTS so the
+            # caller can interrupt after finishing their utterance.
             segment = vad.add(audio, now)
             if segment is None:
                 continue
@@ -1643,12 +1650,11 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             _stt_t0 = time.time()
             async with state["stt_lock"]:
                 loop = asyncio.get_running_loop()
-                segs, _ = await loop.run_in_executor(
-                    None, lambda: state["stt_model"].transcribe(segment, beam_size=1, vad_filter=True))
+                text = await loop.run_in_executor(
+                    None, lambda: transcribe_live(state["stt_model"], segment))
                 stt_latency_ms = (time.time() - _stt_t0) * 1000
                 stt_total_ms += stt_latency_ms
                 stt_count += 1
-                text = " ".join(s.text for s in segs).strip()
             opik_span(_trace, "browser.stt", "general",
                       {"audio_sec": round(len(segment) / 16000, 2)}, {"text": text},
                       _stt_t0, time.time())
@@ -1669,28 +1675,51 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             await ws.send_json({"type": "transcript", "text": text})
             conv = conversation if len(conversation) <= 15 else [conversation[0]] + conversation[-14:]
             _llm_t0 = time.time()
+            bot_text = ""
+            usage = None
             try:
-                resp = await state["llm_client"].chat.completions.create(
-                    model=state["llm_model"], messages=conv, max_tokens=150, temperature=0)
+                stream = await state["llm_client"].chat.completions.create(
+                    model=state["llm_model"], messages=conv, max_tokens=150, temperature=0,
+                    stream=True, stream_options={"include_usage": True})
+                async for chunk in stream:
+                    if getattr(chunk, "usage", None):
+                        usage = chunk.usage
+                        continue
+                    bot_text += chunk.choices[0].delta.content or ""
             except Exception as _e:
                 opik_end_trace(_trace, error=str(_e))
                 raise
             llm_total_ms += (time.time() - _llm_t0) * 1000
             llm_count += 1
-            reply = resp.choices[0].message.content.strip()
-            conversation.append({"role": "assistant", "content": reply})
-            usage = getattr(resp, "usage", None)
             if usage is not None:
                 peak_prompt_tokens = max(peak_prompt_tokens, int(getattr(usage, "prompt_tokens", 0) or 0))
                 total_completion_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
+
+            # Speak the whole response as ONE TTS input (no per-sentence splits,
+            # no truncation): even if the model asks two questions, they are
+            # spoken together in a single stream.
+            cr_idx = bot_text.upper().find("CALL_RESULT")
+            cut = bot_text[:cr_idx] if cr_idx != -1 else bot_text
+            spoken = strip_markers(cut).rstrip().rstrip("[").strip()
+            reply = bot_text.strip()
+            result = parse_call_result(reply)
+            has_result_marker = bool(result or cr_idx != -1)
+
+            # SAFETY NET: if the response asks a question AND emits [CALL_RESULT],
+            # the agent must not finalize before the representative answers —
+            # speak the question(s) and wait instead of ending the call.
+            if has_result_marker and "?" in spoken:
+                log.info("[%s] CALL_RESULT emitted with a pending question — waiting for answer", session_id)
+                result = None
+                has_result_marker = False
+
+            conversation.append({"role": "assistant", "content": reply})
             opik_span(_trace, "browser.llm", "llm", {"messages": conv[-2:]}, reply,
                       _llm_t0, time.time(), model=state["llm_model"],
                       metadata={"usage": {"prompt_tokens": getattr(usage, "prompt_tokens", None),
                                           "completion_tokens": getattr(usage, "completion_tokens", None),
                                           "total_tokens": getattr(usage, "total_tokens", None)}} if usage else None)
 
-            # Retain [CALL_RESULT] JSON for downstream processing, don't speak it
-            result = parse_call_result(reply)
             if result:
                 await state["redis"].hset(f"call:{session_id}", mapping={
                     "claim_id": result.get("claim_id") or "browser",
@@ -1703,10 +1732,22 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                     "call_result": reply,
                 })
 
-            # If CALL_RESULT was emitted, say a farewell and end the call
-            # (otherwise it would go silent and the agent would repeat itself)
-            if result or re.search(r"CALL_RESULT", reply, re.IGNORECASE):
+            # Speak the whole turn as ONE TTS input.
+            if spoken:
+                await ws.send_json({"type": "llm_text", "text": spoken})
+                tts_task = asyncio.create_task(_stream_tts_reply(ws, spoken, tts_fn, _tts_times, trace=_trace))
+                if not has_result_marker:
+                    # Normal turn: end the trace once this TTS completes.
+                    # (the farewell path below ends the trace itself)
+                    asyncio.create_task(_end_browser_trace_after_tts(tts_task, _trace, {"reply": spoken}))
+
+            if has_result_marker:
                 await cancel_tts()
+                if tts_task:
+                    try:
+                        await tts_task
+                    except Exception:
+                        pass
                 farewell = "Okay, thank you. Goodbye!"
                 await ws.send_json({"type": "llm_text", "text": farewell})
                 tts_task = asyncio.create_task(_stream_tts_reply(ws, farewell, tts_fn, _tts_times, trace=_trace))
@@ -1727,14 +1768,6 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                 except Exception:
                     pass
                 return
-
-            # Strip markers for speech + log display
-            spoken = strip_markers(reply)
-            await ws.send_json({"type": "llm_text", "text": spoken})
-
-            # Stream TTS in background so audio reads continue
-            tts_task = asyncio.create_task(_stream_tts_reply(ws, spoken, tts_fn, _tts_times, trace=_trace))
-            asyncio.create_task(_end_browser_trace_after_tts(tts_task, _trace, {"reply": spoken}))
 
     except Exception:
         pass

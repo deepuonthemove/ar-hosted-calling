@@ -20,7 +20,7 @@ import time
 import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 
-from audio import VAD, twilio_to_whisper, piper_to_twilio, rms
+from audio import VAD, twilio_to_whisper, piper_to_twilio, rms, transcribe_live, transcribe_offline
 from prompts import (
     build_call_prompt, build_greeting, parse_markers,
     parse_call_result, load_payer, load_denial_codes, strip_markers,
@@ -241,15 +241,12 @@ class CallSession:
         async with self.stt_lock:
             loop = asyncio.get_running_loop()
             t0 = time.time()
-            segments, _ = await loop.run_in_executor(
-                None,
-                lambda: self.stt_model.transcribe(
-                    audio, beam_size=1, vad_filter=True, language="en"
-                ),
+            text = await loop.run_in_executor(
+                None, lambda: transcribe_live(self.stt_model, audio)
             )
             self.stt_total_ms += (time.time() - t0) * 1000
             self.stt_count += 1
-            return " ".join(s.text for s in segments).strip()
+            return text
 
     async def _transcribe_full(self) -> str:
         """Offline STT on the full μ-law recording (no VAD)."""
@@ -261,12 +258,9 @@ class CallSession:
         f32 = resample(f32, 8000, 16000)                           # to Whisper 16kHz
         async with self.stt_lock:
             loop = asyncio.get_running_loop()
-            segments, _ = await loop.run_in_executor(
-                None, lambda: self.stt_model.transcribe(
-                    f32, beam_size=5, vad_filter=False, language="en"
-                ),
+            return await loop.run_in_executor(
+                None, lambda: transcribe_offline(self.stt_model, f32)
             )
-            return " ".join(s.text for s in segments).strip()
 
     # ── LLM with state machine ───────────────────────────────────────────
     async def _run_llm(self, user_text: str):
@@ -300,6 +294,7 @@ class CallSession:
             usage = None
             sentence_buffer = ""
             seen_call_result = False
+            asked_question = False
             async for chunk in stream:
                 if getattr(chunk, "usage", None):
                     usage = chunk.usage
@@ -313,22 +308,44 @@ class CallSession:
                     marker_idx = re.search(r"CALL_RESULT", bot_text, re.IGNORECASE).start()
                     before = bot_text[:marker_idx]
                     if before.strip():
-                        await self._speak(strip_markers(before))
+                        _pre = strip_markers(before).rstrip().rstrip("[").strip()
+                        if "?" in _pre:
+                            _pre = _pre.split("?")[0] + "?"
+                            asked_question = True
+                        await self._speak(_pre)
                     sentence_buffer = ""
+                    if asked_question:
+                        break
                     continue
                 if seen_call_result:
                     continue
                 sentence_buffer += token
-                if token in (".", "!", "?", "\n") and len(sentence_buffer.strip()) > 2:
+                if token[-1:] in (".", "!", "?", "\n") and len(sentence_buffer.strip()) > 2:
                     parsed = parse_markers(sentence_buffer)
                     if parsed["spoken"]:
-                        await self._speak(parsed["spoken"])
+                        _pre = parsed["spoken"]
+                        if "?" in _pre:
+                            _pre = _pre.split("?")[0] + "?"
+                            asked_question = True
+                        await self._speak(_pre)
                     sentence_buffer = ""
+                    if asked_question:
+                        break
 
-            if sentence_buffer.strip() and not seen_call_result:
+            if sentence_buffer.strip() and not seen_call_result and not asked_question:
                 parsed_tail = parse_markers(sentence_buffer)
                 if parsed_tail["spoken"]:
-                    await self._speak(parsed_tail["spoken"])
+                    _pre = parsed_tail["spoken"]
+                    if "?" in _pre:
+                        _pre = _pre.split("?")[0] + "?"
+                        asked_question = True
+                    await self._speak(_pre)
+
+            # ONE question per turn: stop after the first question so the agent
+            # never bundles questions or finalizes before the rep answers.
+            if asked_question:
+                bot_text = strip_markers(bot_text.split("?")[0] + "?")
+                seen_call_result = False
 
             self.llm_total_ms += (time.time() - llm_t0) * 1000
             self.llm_count += 1
@@ -365,7 +382,20 @@ class CallSession:
             # The marker itself is the end-of-call signal — finalize even if
             # the JSON is missing/malformed (repair is attempted in _finalize).
             call_result = parse_call_result(bot_text)
-            if call_result or re.search(r"CALL_RESULT", bot_text, re.IGNORECASE):
+            has_result_marker = bool(call_result or re.search(r"CALL_RESULT", bot_text, re.IGNORECASE))
+
+            # SAFETY NET: if the response BOTH asks a question (e.g. a
+            # confirmation "...correct?") AND emits [CALL_RESULT], do NOT end
+            # the call — discard the result and wait for the representative's
+            # answer instead of proceeding on our own.
+            if has_result_marker:
+                spoken_before = strip_markers(bot_text.split("[CALL_RESULT]")[0]).strip()
+                if "?" in spoken_before:
+                    log.info("[%s] CALL_RESULT emitted with a pending question — waiting for answer", self.call_sid)
+                    has_result_marker = False
+                    call_result = None
+
+            if has_result_marker:
                 if not call_result:
                     log.info("[%s] CALL_RESULT marker without valid JSON — ending call", self.call_sid)
                 # Say a farewell so the call doesn't end in silence

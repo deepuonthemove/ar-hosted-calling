@@ -57,7 +57,8 @@ export function CallFlow({ projectId, rowNum, accountUid, onActiveChange }: {
     playCtxRef.current = playCtx;
 
     const sid = `browser_${Math.random().toString(36).slice(2, 10)}`;
-    const params = new URLSearchParams({ project_id: projectId, row_num: String(rowNum), tts: "piper", vad: "silero" });
+    // Engine/VAD come from server config (Settings page), not hardcoded here.
+    const params = new URLSearchParams({ project_id: projectId, row_num: String(rowNum) });
     const ws = new WebSocket(wsUrl(`/ws/${sid}?${params}`));
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;

@@ -15,7 +15,7 @@ RUN python -m piper --help > /dev/null 2>&1; \
     echo "warmup" | python -m piper --model en_US-lessac-medium \
       --data-dir /models/piper --output-raw > /dev/null 2>&1 || true
 
-COPY server.py call_session.py audio.py prompts.py ./
+COPY server.py call_session.py audio.py prompts.py tts_common.py tts_piper.py tts_kokoro.py ./
 COPY static/ ./static/
 COPY payers/ ./payers/
 

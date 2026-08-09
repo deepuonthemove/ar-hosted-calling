@@ -127,6 +127,64 @@ def rms(audio: np.ndarray) -> float:
     return float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
 
 
+# ── STT transcription params (faster-whisper) ──────────────────────────
+# Initial prompt biases Whisper toward domain vocabulary. Keep it focused on
+# the AR / medical-billing lexicon (not sentences) so it biases decoding
+# without steering the content.
+STT_INITIAL_PROMPT = (
+    "accounts receivable, AR specialist, medical billing, insurance claim, "
+    "claim status, paid, denied, pending, appeal, denial reason code, remark code, "
+    "payer, provider, NPI, patient, member ID, date of service, billed amount, "
+    "CPT code, diagnosis code, EOB, remittance, deductible, coinsurance, copay, "
+    "coordination of benefits, medical necessity, timely filing, resubmission, "
+    "representative, agent, customer service."
+)
+
+# Live (real-time, VAD-segmented) transcription: beam_size=2 + temperature=0
+# + condition_on_previous_text=False (prevents whisper conditioning on its own
+# previous output, a common source of hallucinated "random words") + low
+# confidence thresholds that drop garbage segments.
+STT_LIVE_PARAMS = dict(
+    beam_size=2,
+    vad_filter=True,
+    temperature=0.0,
+    condition_on_previous_text=False,
+    no_speech_threshold=0.6,
+    log_prob_threshold=-1.0,
+    compression_ratio_threshold=2.4,
+    language="en",
+)
+
+# Offline (full recording, no VAD) transcription: wider beam for accuracy,
+# but still temperature=0 and conditioned on prior text (full-context).
+STT_OFFLINE_PARAMS = dict(
+    beam_size=5,
+    vad_filter=False,
+    temperature=0.0,
+    condition_on_previous_text=True,
+    no_speech_threshold=0.6,
+    log_prob_threshold=-1.0,
+    compression_ratio_threshold=2.4,
+    language="en",
+)
+
+
+def transcribe_live(stt_model, audio: np.ndarray) -> str:
+    """Transcribe a VAD speech segment (real-time path). Returns text."""
+    segments, _ = stt_model.transcribe(
+        audio, **STT_LIVE_PARAMS, initial_prompt=STT_INITIAL_PROMPT
+    )
+    return " ".join(s.text for s in segments).strip()
+
+
+def transcribe_offline(stt_model, audio: np.ndarray) -> str:
+    """Transcribe a full recording (post-call review path). Returns text."""
+    segments, _ = stt_model.transcribe(
+        audio, **STT_OFFLINE_PARAMS, initial_prompt=STT_INITIAL_PROMPT
+    )
+    return " ".join(s.text for s in segments).strip()
+
+
 class VAD:
     """Accumulates speech; returns segment when silence ends utterance.
 
