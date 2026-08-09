@@ -310,6 +310,19 @@ def _fade_edges(pcm_bytes: bytes, fade_ms: int = _SPELL_FADE_MS,
 SPELL_CHAR_TIMEOUT_S = float(os.getenv("SPELL_CHAR_TIMEOUT_S", "2.5"))
 
 
+# Browser-path barge-in: rolling RMS window over ~6 frames (120ms) of mic
+# audio, compared to an ADAPTIVE threshold. The fixed floor (BROWSER_BARGE_RMS)
+# is the minimum; the real threshold is max(floor, echo_baseline * MARGIN),
+# where echo_baseline is the rolling average mic energy while the bot is
+# speaking (i.e. the speaker-echo floor). Real speech is a sudden jump well
+# above that floor, so a margin trigger catches it regardless of how loud the
+# caller's speakers are — no fragile absolute value. Tune via env if needed.
+BROWSER_BARGE_RMS = float(os.getenv("BROWSER_BARGE_RMS", "0.02"))
+BROWSER_BARGE_FRAMES = int(os.getenv("BROWSER_BARGE_FRAMES", "6"))
+BROWSER_BARGE_MARGIN = float(os.getenv("BROWSER_BARGE_MARGIN", "2.0"))
+BROWSER_BASELINE_FRAMES = int(os.getenv("BROWSER_BASELINE_FRAMES", "25"))
+
+
 async def _synth_char_bytes(char_gen, label: str = "?", engine: str = "?",
                              timeout: float = SPELL_CHAR_TIMEOUT_S) -> bytes:
     """Buffer one spelled character's audio (always short) and fade its
@@ -1836,9 +1849,12 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
     conversation.append({"role": "assistant", "content": greeting})
     await ws.send_json({"type": "llm_text", "text": greeting})
     tts_task = speak(greeting)
+    greeting_task = tts_task
 
     vad = VAD(use_silero=use_silero)
     barge_in = False
+    _barge_frames: list[float] = []
+    _barge_baseline: list[float] = []
     full_audio = bytearray()
     call_start = time.time()
     review_saved = False
@@ -1854,6 +1870,14 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             except asyncio.CancelledError:
                 pass
             tts_task = None
+        # Clear the browser's playback buffer too — otherwise audio already
+        # sent is still queued/playing on the client even though the server
+        # stopped producing it, so the current utterance "keeps talking"
+        # while the next reply starts.
+        try:
+            await ws.send_bytes(b"\x02")
+        except Exception:
+            pass
 
     async def _finalize_review():
         nonlocal review_saved
@@ -1880,6 +1904,41 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             # the VAD segment flush below (Silero distinguishes real speech
             # from the bot's own voice), which still cancels the TTS so the
             # caller can interrupt after finishing their utterance.
+            # Barge-in while the bot is speaking: a rolling window of mic RMS
+            # energy compared to an ADAPTIVE echo floor. The VAD flush alone
+            # can't interrupt a long spelled run, because the bot's own audio
+            # echoing into the mic keeps Silero in continuous "speech" so it
+            # never sees the 700ms silence needed to flush. Real speech is a
+            # sudden jump above the measured echo baseline, so triggering on
+            # max(floor, baseline*margin) works no matter the speaker volume.
+            # The greeting is protected so echo can't cancel the first message.
+            if tts_task and not tts_task.done() and tts_task is not greeting_task:
+                _energy = rms(audio)
+                _barge_frames.append(_energy)
+                if len(_barge_frames) > BROWSER_BARGE_FRAMES:
+                    _barge_frames.pop(0)
+                _barge_baseline.append(_energy)
+                if len(_barge_baseline) > BROWSER_BASELINE_FRAMES:
+                    _barge_baseline.pop(0)
+                _floor = sum(_barge_baseline) / max(1, len(_barge_baseline))
+                _thr = max(BROWSER_BARGE_RMS, _floor * BROWSER_BARGE_MARGIN)
+                # Only act once the echo floor is established (~half the
+                # baseline window) so the reply's own opening echo can't
+                # trigger an immediate false barge-in.
+                if (len(_barge_baseline) >= BROWSER_BASELINE_FRAMES // 2
+                        and len(_barge_frames) == BROWSER_BARGE_FRAMES
+                        and sum(_barge_frames) / BROWSER_BARGE_FRAMES > _thr):
+                    await cancel_tts()
+                    _barge_frames = []
+                    await ws.send_bytes(b"\x02")
+                    # Reset VAD so the echo-accumulated buffer is dropped; the
+                    # caller's speech after this point starts a clean segment.
+                    vad = VAD(use_silero=use_silero)
+                    continue
+            else:
+                _barge_frames = []
+                _barge_baseline = []
+
             segment = vad.add(audio, now)
             if segment is None:
                 continue
