@@ -56,6 +56,14 @@ PIPER_RATE = int(os.getenv("PIPER_SAMPLE_RATE", "22050"))
 PIPER_DATA_DIR = os.getenv("PIPER_DATA_DIR", "/models/piper")
 # >1.0 = slower (length-scale), 1.0 = normal
 PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.35"))
+# Length-scale for spelled-out characters. Same lesson as Kokoro's speed:
+# pushing this well above normal (was 2.0) over-stretches the vowel in each
+# character's name ("es" -> a drawled "eeeese", "ay" -> "aaaaye"), hurting
+# recognizability instead of helping it. Articulation is clearest at
+# close-to-normal speed; the slow, clear "spelling" feel comes from the real
+# silence gaps injected between characters (SPELL_CHAR_GAP_MS), not from
+# stretching each word out.
+PIPER_SPELL_LENGTH_SCALE = float(os.getenv("PIPER_SPELL_LENGTH_SCALE", "1.4"))
 
 TTS_ENGINE = os.getenv("TTS_ENGINE", "piper")
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_bella")
@@ -63,6 +71,19 @@ KOKORO_RATE = 24000
 # <1.0 = slower (speed), 1.0 = normal
 KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "0.81"))
 KOKORO_DEVICE = os.getenv("KOKORO_DEVICE", "cuda")
+# Kokoro is NOT used for spelled-out characters — measured on real audio
+# that Kokoro's isolated single-word renders (e.g. "tee") come out both
+# less articulate and quieter than Piper's, and slowing them down below
+# ~1.0 speed breaks Kokoro's duration model outright (a bogus near-silent
+# gap inside the word). Piper measured clean on the same isolated-word
+# test in every dimension, so every spelled character goes through Piper
+# instead, even on a call that's otherwise using Kokoro — see
+# _spell_char_audio.
+
+# Real silence injected between spelled-out characters/groups, so pacing
+# doesn't depend on how each engine happens to interpret punctuation.
+SPELL_CHAR_GAP_MS = int(os.getenv("SPELL_CHAR_GAP_MS", "260"))
+SPELL_GROUP_GAP_MS = int(os.getenv("SPELL_GROUP_GAP_MS", "420"))
 
 VAD_MODE = os.getenv("VAD_MODE", "silero")  # "rms" or "silero"
 
@@ -190,11 +211,15 @@ def load_models():
 
 
 # ── TTS text preprocessing ───────────────────────────────────────────────
-# Engine-specific transforms live in tts_piper.py / tts_kokoro.py (shared
-# logic in tts_common.py) because Piper and Kokoro honor punctuation pauses
-# differently.
+# Text transforms are shared (tts_common.py) — spelled-out runs (IDs,
+# addresses, letter-by-letter names) come back wrapped in SPELL_START/
+# SPELL_END sentinels. The audio layer below splits on those and synthesizes
+# spelled segments character-by-character, at a slower rate, with real
+# silence injected between characters — pacing that doesn't depend on how
+# either engine happens to interpret punctuation.
 import tts_piper as _tts_piper_mod
 import tts_kokoro as _tts_kokoro_mod
+from tts_common import split_spell_segments, flatten_spell_segments, SPELL_PAUSE
 
 _TTS_MODS = {"piper": _tts_piper_mod, "kokoro": _tts_kokoro_mod}
 
@@ -212,6 +237,104 @@ def _piper_next(gen):
         return None
 
 
+def _silence_bytes(ms: int) -> bytes:
+    n = int(PIPER_RATE * ms / 1000)
+    return np.zeros(n, dtype=np.int16).tobytes()
+
+
+# Feeding the engine a bare, context-free symbol ("T", "5") triggers its
+# "spell this out" handling, which both engines render with a leading
+# percussive "t"/click — happens for digits too, and trimming to remove it
+# sometimes ate the real letter instead (short letters vs. a fixed-ms trim
+# can't be told apart reliably). That means the artifact is baked into the
+# generated content, not a splice/boundary effect — no amount of waveform
+# post-processing fixes that. So instead we don't synthesize the bare
+# symbol at all: each character is spoken as its ordinary name ("tee",
+# "five") — a normal short word, which is squarely inside what these
+# engines are trained on and renders cleanly.
+_LETTER_NAMES = {
+    "A": "ay", "B": "bee", "C": "see", "D": "dee", "E": "ee", "F": "eff",
+    "G": "jee", "H": "aitch", "I": "eye", "J": "jay", "K": "kay", "L": "el",
+    "M": "em", "N": "en", "O": "oh", "P": "pee", "Q": "cue", "R": "are",
+    "S": "es", "T": "tee", "U": "you", "V": "vee", "W": "double you",
+    "X": "ex", "Y": "why", "Z": "zee",
+}
+_DIGIT_NAMES = {
+    "0": "zero", "1": "one", "2": "two", "3": "three", "4": "four",
+    "5": "five", "6": "six", "7": "seven", "8": "eight", "9": "nine",
+}
+
+
+def _spoken_char(tok: str) -> str:
+    return _LETTER_NAMES.get(tok.upper(), _DIGIT_NAMES.get(tok, tok))
+
+
+# Light safety-net fade for a clean splice into the surrounding silence.
+_SPELL_FADE_MS = int(os.getenv("SPELL_FADE_MS", "12"))
+
+# Measured on real audio: Kokoro renders very short isolated words (e.g.
+# "tee" at -15dBFS, "es" at -13dBFS) noticeably quieter than normal
+# continuous speech (-6 to -8dBFS) — some spelled letters end up too quiet
+# to hear clearly. Boost each character's peak up to this target so it
+# matches normal speech loudness. Only ever boosts UP, never attenuates —
+# Piper's per-word output is already near full-scale, so this is a no-op
+# for it and only helps Kokoro's quieter renders.
+_SPELL_TARGET_PEAK = int(os.getenv("SPELL_TARGET_PEAK", "22000"))
+
+
+def _fade_edges(pcm_bytes: bytes, fade_ms: int = _SPELL_FADE_MS,
+                 target_peak: int = _SPELL_TARGET_PEAK) -> bytes:
+    if not pcm_bytes:
+        return pcm_bytes
+    arr = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+    peak = np.abs(arr).max()
+    if 0 < peak < target_peak:
+        arr = np.clip(arr * (target_peak / peak), -32767, 32767)
+    n = len(arr)
+    fade_n = min(int(PIPER_RATE * fade_ms / 1000), n // 2)
+    if fade_n > 0:
+        ramp = np.linspace(0.0, 1.0, fade_n, dtype=np.float32)
+        arr[:fade_n] *= ramp
+        arr[-fade_n:] *= ramp[::-1]
+    return arr.astype(np.int16).tobytes()
+
+
+# Each spelled character is its own fresh synth call (phonemizer + model
+# invocation from scratch), which can occasionally take much longer than a
+# continuation chunk of normal speech would. asyncio can only deliver a
+# cancellation (barge-in) at the next await checkpoint — if that checkpoint
+# is buried inside one slow character call, cancellation is deferred until
+# it finishes. On a long spelled ID that delay stacks up across characters
+# and barge-in can feel like it isn't working. Bound each character to a
+# timeout so a slow/stuck call can never block cancellation for long.
+SPELL_CHAR_TIMEOUT_S = float(os.getenv("SPELL_CHAR_TIMEOUT_S", "2.5"))
+
+
+async def _synth_char_bytes(char_gen, label: str = "?", engine: str = "?",
+                             timeout: float = SPELL_CHAR_TIMEOUT_S) -> bytes:
+    """Buffer one spelled character's audio (always short) and fade its
+    edges, instead of streaming it raw — removes the click/static pop that a
+    fresh isolated synth call produces at onset. Bounded by `timeout` so a
+    single character can't stall cancellation indefinitely. Logs how long
+    the call took, so it's visible whether per-character synth is the thing
+    delaying barge-in during a long spell."""
+    async def _collect():
+        buf = bytearray()
+        async for b in char_gen:
+            buf.extend(b)
+        return bytes(buf)
+
+    t0 = time.time()
+    try:
+        buf = await asyncio.wait_for(_collect(), timeout=timeout)
+    except asyncio.TimeoutError:
+        log.warning("[spell] %s char %r: exceeded %.1fs — skipping it", engine, label, timeout)
+        return b""
+    elapsed_ms = (time.time() - t0) * 1000
+    log.info("[spell] %s char %r: %.0fms", engine, label, elapsed_ms)
+    return _fade_edges(buf)
+
+
 # Serializes in-process Piper synthesis. The shared ONNX session is not safe
 # under concurrency (e.g. a cancelled TTS leaving an executor thread mid-inference).
 _tts_lock = None
@@ -224,26 +347,91 @@ async def _get_tts_lock():
     return _tts_lock
 
 
+# Measured on real audio: Kokoro's isolated single-word renders (what a
+# spelled-out character becomes, e.g. "tee") come out both quieter AND less
+# articulate than Piper's — gain-boosting the volume didn't fix clarity
+# because the underlying render itself is muddier, not just quiet. Piper's
+# isolated-word renders measured clean (continuous envelope, near-full-scale
+# volume) in the same tests. So EVERY spelled character is synthesized via
+# Piper, even on a call that's otherwise using Kokoro for normal speech —
+# use the engine that's actually good at this specific job.
+async def _spell_char_audio(tok: str, stop_event: "asyncio.Event | None" = None) -> bytes:
+    if stop_event is not None and stop_event.is_set():
+        return b""
+    voice = state.get("piper_voice")
+    if voice is None:
+        return b""
+    from piper.config import SynthesisConfig
+    cfg = SynthesisConfig(length_scale=PIPER_SPELL_LENGTH_SCALE)
+    loop = asyncio.get_running_loop()
+
+    async def synth():
+        gen = voice.synthesize(_spoken_char(tok), cfg)
+        while True:
+            chunk = await loop.run_in_executor(None, _piper_next, gen)
+            if chunk is None:
+                break
+            yield chunk.audio_int16_bytes
+
+    lock = await _get_tts_lock()
+    async with lock:
+        if stop_event is not None and stop_event.is_set():
+            return b""
+        return await _synth_char_bytes(synth(), label=tok, engine="piper")
+
+
 # ── Piper TTS streaming ──────────────────────────────────────────────────
-async def tts_stream(text: str):
-    text = tts_text(text, "piper")
+async def _piper_synth_segments(segments, stop_event: "asyncio.Event | None" = None):
+    """Synthesize (is_spelled, content) segments from split_spell_segments():
+    plain segments at normal speed, spelled segments one character at a time
+    at a slower length-scale with real silence between characters.
+
+    `stop_event`, when set, is checked at every segment/character boundary
+    so a barge-in stops the NEXT unit of work immediately — it doesn't wait
+    on asyncio task-cancellation semantics, which can be deferred until a
+    slow in-flight synth call finishes when a spelled run has many
+    characters queued up."""
     voice = state.get("piper_voice")
     if voice is not None:
         # Persistent in-process model — first audio in ~0.1s (vs ~1.8s subprocess)
         from piper.config import SynthesisConfig
-        cfg = SynthesisConfig(length_scale=PIPER_LENGTH_SCALE)
-        lock = await _get_tts_lock()
-        async with lock:
-            gen = voice.synthesize(text, cfg)
-            loop = asyncio.get_running_loop()
+        cfg_normal = SynthesisConfig(length_scale=PIPER_LENGTH_SCALE)
+        loop = asyncio.get_running_loop()
+
+        async def synth(t, cfg):
+            gen = voice.synthesize(t, cfg)
             while True:
                 chunk = await loop.run_in_executor(None, _piper_next, gen)
                 if chunk is None:
                     break
                 yield chunk.audio_int16_bytes
+
+        for is_spell, content in segments:
+            if stop_event is not None and stop_event.is_set():
+                return
+            if not is_spell:
+                lock = await _get_tts_lock()
+                async with lock:
+                    async for b in synth(content, cfg_normal):
+                        if stop_event is not None and stop_event.is_set():
+                            return
+                        yield b
+                continue
+            for tok in content:
+                if stop_event is not None and stop_event.is_set():
+                    return
+                if tok == SPELL_PAUSE:
+                    yield _silence_bytes(SPELL_GROUP_GAP_MS)
+                    continue
+                audio = await _spell_char_audio(tok, stop_event=stop_event)
+                if audio:
+                    yield audio
+                yield _silence_bytes(SPELL_CHAR_GAP_MS)
         return
 
-    # Fallback: subprocess
+    # Fallback: subprocess. Spinning up the Piper CLI per character would be
+    # far too slow, so flatten spelled runs into plain, period-separated text.
+    flat = flatten_spell_segments(segments)
     proc = await asyncio.create_subprocess_exec(
         "python", "-m", "piper",
         "--model", PIPER_VOICE,
@@ -255,7 +443,7 @@ async def tts_stream(text: str):
         stderr=asyncio.subprocess.DEVNULL,
     )
     try:
-        proc.stdin.write(text.encode())
+        proc.stdin.write(flat.encode())
         await proc.stdin.drain()
         proc.stdin.close()
         while True:
@@ -273,6 +461,13 @@ async def tts_stream(text: str):
                 pass
 
 
+async def tts_stream(text: str, stop_event: "asyncio.Event | None" = None):
+    text = tts_text(text, "piper")
+    segments = split_spell_segments(text)
+    async for chunk in _piper_synth_segments(segments, stop_event=stop_event):
+        yield chunk
+
+
 # ── Kokoro TTS streaming ────────────────────────────────────────────────
 # Serializes in-process Kokoro synthesis (single KPipeline, not thread-safe
 # under concurrent calls).
@@ -286,35 +481,69 @@ async def _get_kokoro_lock():
     return _kokoro_lock
 
 
-async def kokoro_stream(text: str):
+async def _kokoro_synth_segments(segments, stop_event: "asyncio.Event | None" = None):
     from audio import resample
-    text = tts_text(text, "kokoro")
     pipeline = state.get("kokoro_pipeline")
     if not pipeline:
         log.warning("Kokoro not loaded, falling back to Piper")
-        async for chunk in tts_stream(text):
+        async for chunk in _piper_synth_segments(segments, stop_event=stop_event):
             yield chunk
         return
     loop = asyncio.get_running_loop()
-    lock = await _get_kokoro_lock()
+
+    async def synth(t, speed):
+        gen = pipeline(t, voice=KOKORO_VOICE, speed=speed)
+        while True:
+            result = await loop.run_in_executor(None, _piper_next, gen)
+            if result is None:
+                break
+            if result.audio is None or len(result.audio) == 0:
+                continue
+            audio = result.audio
+            if KOKORO_RATE != PIPER_RATE:
+                audio = resample(audio, KOKORO_RATE, PIPER_RATE)
+            pcm = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+            yield pcm.tobytes()
+
     try:
         # Stream segment-by-segment (do NOT list() the whole pipeline — that
         # forces the full synthesis before any audio, causing long silence).
-        async with lock:
-            gen = pipeline(text, voice=KOKORO_VOICE, speed=KOKORO_SPEED)
-            while True:
-                result = await loop.run_in_executor(None, _piper_next, gen)
-                if result is None:
-                    break
-                if result.audio is None or len(result.audio) == 0:
+        # `stop_event` is checked at every boundary so a barge-in stops the
+        # NEXT unit of work immediately, rather than waiting on asyncio
+        # task-cancellation timing (see _piper_synth_segments for why that
+        # matters on a long spelled run).
+        for is_spell, content in segments:
+            if stop_event is not None and stop_event.is_set():
+                return
+            if not is_spell:
+                lock = await _get_kokoro_lock()
+                async with lock:
+                    async for b in synth(content, KOKORO_SPEED):
+                        if stop_event is not None and stop_event.is_set():
+                            return
+                        yield b
+                continue
+            # Spelled characters go through Piper, not Kokoro — see
+            # _spell_char_audio for why.
+            for tok in content:
+                if stop_event is not None and stop_event.is_set():
+                    return
+                if tok == SPELL_PAUSE:
+                    yield _silence_bytes(SPELL_GROUP_GAP_MS)
                     continue
-                audio = result.audio
-                if KOKORO_RATE != PIPER_RATE:
-                    audio = resample(audio, KOKORO_RATE, PIPER_RATE)
-                pcm = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
-                yield pcm.tobytes()
+                audio = await _spell_char_audio(tok, stop_event=stop_event)
+                if audio:
+                    yield audio
+                yield _silence_bytes(SPELL_CHAR_GAP_MS)
     except Exception as e:
         log.error("Kokoro TTS error: %s", e)
+
+
+async def kokoro_stream(text: str, stop_event: "asyncio.Event | None" = None):
+    text = tts_text(text, "kokoro")
+    segments = split_spell_segments(text)
+    async for chunk in _kokoro_synth_segments(segments, stop_event=stop_event):
+        yield chunk
 
 
 def get_tts_fn(engine: str):

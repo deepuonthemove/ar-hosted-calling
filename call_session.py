@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import time
+from collections import deque
 
 import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
@@ -93,12 +94,24 @@ class CallSession:
 
         self.vad = VAD(use_silero=self.use_silero)
         self.is_bot_speaking = False
+        self.tts_interruptible = True
+        # ~120ms rolling window of recent caller audio, checked for barge-in
+        # instead of a single 20ms Twilio frame — a lone frame can land on a
+        # low-energy instant mid-word (e.g. a plosive gap) even during loud
+        # speech, making single-frame RMS checks fire unreliably.
+        self._barge_audio_buf: deque = deque(maxlen=6)
         self.is_call_ended = False
         self.last_activity = time.time()
         self.last_hold_nudge = 0.0
         self.conversation: list[dict] = []
         self.system_prompt = build_call_prompt("GREETING", None, None, None)
         self.tts_task: asyncio.Task | None = None
+        # Set (synchronously, no await needed) the instant a barge-in
+        # happens, so the TTS generator's own segment/character loop stops
+        # queuing further audio immediately — doesn't depend on asyncio
+        # task-cancellation timing, which can be deferred until a slow
+        # in-flight synth call finishes on a long spelled run.
+        self.tts_stop_event: asyncio.Event | None = None
         self.watchdog_task: asyncio.Task | None = None
         self.last_tts_duration: float = 0.0
 
@@ -176,7 +189,7 @@ class CallSession:
         greeting = build_greeting(self.account)
         self.conversation.append({"role": "assistant", "content": greeting})
         await self._live_append({"role": "assistant", "text": greeting})
-        await self._speak(greeting)
+        await self._speak(greeting, interruptible=False)
         self.state = "IVR_NAV"
 
     async def _on_media(self, data: dict):
@@ -186,12 +199,22 @@ class CallSession:
         now = time.time()
         self.last_activity = now
 
-        # Barge-in: user spoke while bot is talking
-        if self.is_bot_speaking and rms(audio) > 0.02:
-            await self._barge_in()
+        # Barge-in: user spoke while bot is talking. Checked over a short
+        # rolling window rather than this one 20ms frame, so a single quiet
+        # instant mid-word doesn't mask genuine speech.
+        self._barge_audio_buf.append(audio)
+        if self.is_bot_speaking and self.tts_interruptible:
+            recent = np.concatenate(list(self._barge_audio_buf))
+            if rms(recent) > 0.02:
+                await self._barge_in()
 
         segment = self.vad.add(audio, now)
         if segment is None:
+            return
+
+        if self.is_bot_speaking and not self.tts_interruptible:
+            # Protected utterance (the greeting) is still playing — let it
+            # finish rather than acting on speech captured underneath it.
             return
 
         await self._cancel_tts()
@@ -532,22 +555,30 @@ class CallSession:
         self.last_verify_phrase = None
 
     # ── TTS → Twilio ────────────────────────────────────────────────────
-    async def _speak(self, text: str):
+    async def _speak(self, text: str, interruptible: bool = True):
         if not text or not text.strip():
             return
         if self.is_call_ended or not self.stream_sid:
             log.warning("[%s] _speak skipped (ended=%s sid=%s): %r", self.call_sid, self.is_call_ended, self.stream_sid, text[:40])
             return
-        self.tts_task = asyncio.create_task(self._stream_tts(text))
+        # A prior utterance still in flight (e.g. the LLM streamed another
+        # sentence before the last one finished) must be stopped first —
+        # otherwise it keeps sending audio in the background, orphaned, and
+        # a later barge-in can't reach it since self.tts_task will already
+        # point at this new one.
+        await self._cancel_tts()
+        self.tts_interruptible = interruptible
+        self.tts_stop_event = asyncio.Event()
+        self.tts_task = asyncio.create_task(self._stream_tts(text, self.tts_stop_event))
 
-    async def _stream_tts(self, text: str):
+    async def _stream_tts(self, text: str, stop_event: asyncio.Event):
         try:
             log.info("[%s] TTS start: %r", self.call_sid, text[:40])
             tts_t0 = time.time()
             frame = bytearray()
             sent_samples = 0
             audio_started = False
-            async for pcm_chunk in self.tts_stream_fn(text):
+            async for pcm_chunk in self.tts_stream_fn(text, stop_event=stop_event):
                 mulaw = piper_to_twilio(
                     np.frombuffer(pcm_chunk, dtype=np.int16), PIPER_RATE
                 )
@@ -592,6 +623,12 @@ class CallSession:
             self.is_bot_speaking = False
 
     async def _cancel_tts(self):
+        # Set first and synchronously — the generator checks this at every
+        # segment/character boundary, so it stops queuing further audio
+        # immediately, without waiting for task.cancel() to actually land
+        # (which can be deferred if a synth call is already in flight).
+        if self.tts_stop_event is not None:
+            self.tts_stop_event.set()
         if self.tts_task and not self.tts_task.done():
             self.tts_task.cancel()
             try:
