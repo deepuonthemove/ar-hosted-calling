@@ -1817,11 +1817,25 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
     tts_total_ms = 0.0
     tts_count = 0
 
+    tts_task = None
+    # Set synchronously the instant we want to stop — the generator checks
+    # this at every segment/character boundary, so it stops queuing further
+    # audio immediately rather than waiting on task-cancellation timing
+    # (which can be deferred until an in-flight synth call finishes).
+    tts_stop_event: asyncio.Event | None = None
+
+    def speak(text: str, trace=None):
+        nonlocal tts_task, tts_stop_event
+        tts_stop_event = asyncio.Event()
+        tts_task = asyncio.create_task(
+            _stream_tts_reply(ws, text, tts_fn, _tts_times, trace=trace, stop_event=tts_stop_event))
+        return tts_task
+
     # Speak greeting with claim context right away
     greeting = build_greeting(account)
     conversation.append({"role": "assistant", "content": greeting})
     await ws.send_json({"type": "llm_text", "text": greeting})
-    tts_task = asyncio.create_task(_stream_tts_reply(ws, greeting, tts_fn, _tts_times))
+    tts_task = speak(greeting)
 
     vad = VAD(use_silero=use_silero)
     barge_in = False
@@ -1830,7 +1844,9 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
     review_saved = False
 
     async def cancel_tts():
-        nonlocal tts_task
+        nonlocal tts_task, tts_stop_event
+        if tts_stop_event is not None:
+            tts_stop_event.set()
         if tts_task and not tts_task.done():
             tts_task.cancel()
             try:
@@ -1964,7 +1980,7 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             # Speak the whole turn as ONE TTS input.
             if spoken:
                 await ws.send_json({"type": "llm_text", "text": spoken})
-                tts_task = asyncio.create_task(_stream_tts_reply(ws, spoken, tts_fn, _tts_times, trace=_trace))
+                tts_task = speak(spoken, trace=_trace)
                 if not has_result_marker:
                     # Normal turn: end the trace once this TTS completes.
                     # (the farewell path below ends the trace itself)
@@ -1979,7 +1995,7 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                         pass
                 farewell = "Okay, thank you. Goodbye!"
                 await ws.send_json({"type": "llm_text", "text": farewell})
-                tts_task = asyncio.create_task(_stream_tts_reply(ws, farewell, tts_fn, _tts_times, trace=_trace))
+                tts_task = speak(farewell, trace=_trace)
                 if tts_task:
                     try:
                         await asyncio.wait_for(tts_task, timeout=10)
@@ -2002,6 +2018,8 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
         pass
     finally:
         await _finalize_review()
+        if tts_stop_event is not None:
+            tts_stop_event.set()
         if tts_task and not tts_task.done():
             tts_task.cancel()
             try:
@@ -2022,12 +2040,12 @@ async def _end_browser_trace_after_tts(tts_task, trace, output):
 
 
 async def _stream_tts_reply(ws: WebSocket, text: str, tts_fn=tts_stream, tts_times: list | None = None,
-                            trace=None):
+                            trace=None, stop_event: "asyncio.Event | None" = None):
     t0 = time.time()
     first = True
     total_bytes = 0
     try:
-        async for pcm_bytes in tts_fn(text):
+        async for pcm_bytes in tts_fn(text, stop_event=stop_event):
             if first and tts_times is not None:
                 tts_times.append((time.time() - t0) * 1000)
                 first = False
