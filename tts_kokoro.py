@@ -15,4 +15,4 @@ def tts_text(text: str) -> str:
     "..." (slower than the periods Piper uses). Ellipses from the model are
     also kept as-is, not normalized.
     """
-    return base_transforms(text, spell_sep="...")
+    return base_transforms(text, spell_sep="... ")

@@ -30,6 +30,7 @@ _STATE_CODES = {
 
 # Street suffixes expanded to full words — only within a matched street
 # address (requires a leading number) so "Dr. Smith" is never "drive Smith".
+# These are common, unambiguous words: SAY them plainly, never spell them.
 _ADDR_SUFFIXES = {
     "st.": "street", "st": "street", "ave.": "avenue", "ave": "avenue",
     "rd.": "road", "rd": "road", "blvd.": "boulevard", "blvd": "boulevard",
@@ -109,7 +110,7 @@ _HYPHEN_GROUP_RE = re.compile(r"\b(\d{1,4}(?:-\d{1,4})+)\b")
 
 
 def _group_hyphen_digits(m, sep):
-    return sep.join(" ".join(g) for g in m.group(1).split("-"))
+    return ", ".join(sep.join(g) for g in m.group(1).split("-"))
 
 
 # Mixed alphanumeric IDs / claim numbers ("2026085EH4375", "A1B2C3D4") —
@@ -123,60 +124,100 @@ def _slow_alnum_id(m, sep):
     return sep.join(m.group(0))
 
 
-def _say_and_spell(part, sep="."):
-    """For one address component: say it fully, then spell it letter-by-letter.
-    Returns None when the part is empty."""
-    if not part:
+def _say_plain(raw):
+    """A common, unambiguous address word (street suffix): just say it — never spelled."""
+    low = raw.lower().strip(".,")
+    return _ADDR_SUFFIXES.get(low, raw)
+
+
+def _spell_digits(raw, sep):
+    """A number-only component (street number, zip, suite/apt number). Reading
+    the digits one by one already IS the slow/clear form — no separate 'say'
+    pass is needed on top of it."""
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
         return None
-    part = part.strip(" ,").strip()
-    if not part:
-        return None
-    low = part.lower().strip(".,")
-    if low in _ADDR_SUFFIXES:
-        full = _ADDR_SUFFIXES[low]
-    elif re.match(r"^(ste|suite|apt)\s+\d+$", low):
-        label = "suite" if low.startswith(("ste", "suite")) else "apartment"
-        full = f"{label} {part.split()[-1]}"
-    elif low in ("ste", "suite"):
-        full = "suite"
-    elif low == "apt":
-        full = "apartment"
-    else:
-        full = part
-    # 2-letter state code: just spell the letters ("CA" -> "C A")
-    if len(full) <= 2 and full.isalpha():
-        return " ".join(full.upper())
-    # Pure numbers: reading the digits IS the spelling, so say them once,
-    # slowly ("91786" -> "9. 1. 7. 8. 6").
-    if full.isdigit():
-        return sep.join(full)
-    spelled = sep.join(full.upper().replace(" ", ""))
-    return f"{full}. spelled, {spelled}"
+    return sep.join(digits)
+
+
+def _spell_letters(raw, sep):
+    """A 2-letter state code: there is no word to say first, just spell it."""
+    return sep.join(raw.upper())
+
+
+def _say_and_spell(raw, sep):
+    """An ambiguous proper noun (street/city name): say it fully once, then
+    spell it letter-by-letter so it can't be misheard."""
+    spelled = sep.join(re.sub(r"\s+", "", raw).upper())
+    return f"{raw}. spelled, {spelled}"
+
+
+def _say_suite(raw, sep):
+    low = raw.lower().strip(".,")
+    m = re.match(r"^(ste|suite|apt)\.?\s+(\d+)$", low)
+    if not m:
+        return raw
+    label = "suite" if m.group(1).startswith(("ste", "suite")) else "apartment"
+    digits = _spell_digits(m.group(2), sep)
+    return f"{label}. {digits}" if digits else label
+
+
+# How each address component should be voiced: digits are spelled digit-by-
+# digit (that already is the clear/slow form); the suffix is a common word
+# that's just said; only the street/city NAME is ambiguous enough to warrant
+# saying it once and then spelling it letter-by-letter.
+_ADDR_COMPONENT_KIND = {
+    "num": "digits",
+    "name": "sayspell",
+    "suffix": "plain",
+    "suite": "suite",
+    "city": "sayspell",
+    "state": "letters",
+    "zip": "digits",
+}
 
 
 def _slow_address(m, sep="."):
     out = []
-    for key in ("num", "name", "suffix", "suite", "city", "state", "zip"):
-        s = _say_and_spell(m.group(key), sep)
+    for key, kind in _ADDR_COMPONENT_KIND.items():
+        raw = m.group(key)
+        if not raw:
+            continue
+        raw = raw.strip(" ,").strip()
+        if not raw:
+            continue
+        if kind == "digits":
+            s = _spell_digits(raw, sep)
+        elif kind == "letters":
+            s = _spell_letters(raw, sep)
+        elif kind == "plain":
+            s = _say_plain(raw)
+        elif kind == "suite":
+            s = _say_suite(raw, sep)
+        else:
+            s = _say_and_spell(raw, sep)
         if s:
             out.append(s)
     return ". ".join(out)
 
 
-def _group_digits(m):
+def _group_digits(m, sep):
     """Read a long digit run slowly: individual digits in chunks of 4,
     comma-separated so TTS pauses between chunks (claims/phone numbers)."""
     s = m.group(0)
     groups = [s[i:i + 4] for i in range(0, len(s), 4)]
-    return ", ".join(" ".join(g) for g in groups)
+    return ", ".join(sep.join(g) for g in groups)
 
 
-def base_transforms(text: str, spell_sep: str = ".") -> str:
+def base_transforms(text: str, spell_sep: str = ". ") -> str:
     """Apply the shared transforms common to every TTS engine.
 
     `spell_sep` is the character separator used when spelling letters/digits
-    one by one. Piper reads periods slowest (default); Kokoro pauses longest
-    on "..." so tts_kokoro passes spell_sep="...".
+    one by one. It always includes a trailing space so each spelled
+    character reads as its own short sentence — without the space, engines
+    tend to parse a run like "S.A.N" as a single abbreviation and rush it.
+    Piper reads periods slowest (". "); Kokoro pauses longest on "..." so
+    tts_kokoro passes spell_sep="... ".
     """
     text = _DATE_RE.sub(lambda m: format_dos(m.group(1)), text)
     text = _PO_BOX_RE.sub("P O Box", text)
@@ -187,4 +228,4 @@ def base_transforms(text: str, spell_sep: str = ".") -> str:
     text = _CHAR_SPELL_RE.sub(lambda m: _slow_char_spell(m, spell_sep), text)
     text = _ALNUM_ID_RE.sub(lambda m: _slow_alnum_id(m, spell_sep), text)
     text = _HYPHEN_GROUP_RE.sub(lambda m: _group_hyphen_digits(m, spell_sep), text)
-    return _NUM_ID_RE.sub(_group_digits, text)
+    return _NUM_ID_RE.sub(lambda m: _group_digits(m, spell_sep), text)
