@@ -635,7 +635,7 @@ async def _save_review(session_id: str, conversation: list[dict], full_audio: by
                               + (tts_total_ms / max(1, tts_count)))),
         "peak_prompt_tokens": str(peak_prompt_tokens),
         "total_completion_tokens": str(total_completion_tokens),
-        "context_limit": "4096",
+        "context_limit": "8192",
     })
 
     # Save audio to Redis (24h TTL)
@@ -1943,6 +1943,15 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             if segment is None:
                 continue
 
+            # The greeting is non-interruptible: let it play fully before
+            # acting on speech captured underneath it (protects the very
+            # first message from echo/noise cancelling it).
+            if tts_task is greeting_task:
+                try:
+                    await tts_task
+                except Exception:
+                    pass
+
             await cancel_tts()
             barge_in = False
 
@@ -2033,6 +2042,7 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                     "denial_code": result.get("denial_code") or "",
                     "paid_amount": str(result.get("paid_amount") or ""),
                     "call_summary": result.get("call_summary") or "",
+                    "reference_number": result.get("reference_number") or "",
                     "call_result": reply,
                 })
 
@@ -2073,8 +2083,8 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
                     pass
                 return
 
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("[%s] browser call ended: %s", session_id, e)
     finally:
         await _finalize_review()
         if tts_stop_event is not None:

@@ -93,7 +93,7 @@ export function CallDetail({ callId }: { callId: string }) {
           </CardHeader>
           <CardContent>
             <dl className="grid grid-cols-2 gap-3 text-sm">
-              {["denial_code", "denial_description", "paid_amount", "billed_amount", "appeal_deadline", "call_summary"].map((k) => (
+              {["reference_number", "denial_code", "denial_description", "paid_amount", "billed_amount", "appeal_deadline", "call_summary"].map((k) => (
                 <div key={k} className={k === "call_summary" ? "col-span-2" : ""}>
                   <dt className="text-xs text-muted-foreground">{k}</dt>
                   <dd>{c[k] || "—"}</dd>

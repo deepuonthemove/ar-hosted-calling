@@ -10,7 +10,7 @@ services:
     command:
       - --model=${LLM_MODEL:-Qwen/Qwen2.5-7B-Instruct-AWQ}
       - --gpu-memory-utilization=0.55
-      - --max-model-len=4096
+      - --max-model-len=8192
       - --max-num-seqs=12
       - --quantization=awq
       - --dtype=auto

@@ -160,11 +160,18 @@ class CallSession:
                 elif event == "stop":
                     await self._finalize("disconnected")
                     break
+                # A handler (end-of-call / CALL_RESULT) may have finalized and
+                # closed the WS — stop reading instead of erroring on it.
+                if self.is_call_ended:
+                    break
         except WebSocketDisconnect:
             await self._finalize("disconnected")
         except Exception as e:
-            log.error("[%s] Session error: %s", self.call_sid, e)
-            await self._finalize("failed", error=str(e))
+            if self.is_call_ended:
+                log.info("[%s] WS closed after finalize (%s)", self.call_sid, e)
+            else:
+                log.error("[%s] Session error: %s", self.call_sid, e)
+                await self._finalize("failed", error=str(e))
         finally:
             if self.watchdog_task:
                 self.watchdog_task.cancel()
@@ -753,7 +760,7 @@ class CallSession:
             if result:
                 for key in ["payer", "claim_id", "next_action", "denial_code",
                             "paid_amount", "billed_amount", "appeal_deadline",
-                            "call_summary", "satisfaction"]:
+                            "call_summary", "reference_number", "satisfaction"]:
                     if key in result and result[key] is not None:
                         update[key] = str(result[key])
                 update["payer"] = result.get("payer") or call_data.get("payer", "unknown")
@@ -768,7 +775,7 @@ class CallSession:
             update["ttr_avg_ms"] = str(int(stt_avg + llm_avg + tts_avg))
             update["peak_prompt_tokens"] = str(self.peak_prompt_tokens)
             update["total_completion_tokens"] = str(self.total_completion_tokens)
-            update["context_limit"] = "4096"
+            update["context_limit"] = "8192"
             if error:
                 update["last_error"] = error
 
