@@ -11,6 +11,10 @@ interface Config {
   tts_engine: string;
   vad_mode: string;
   stay_awake: boolean;
+  kokoro_voice: string;
+  spell_engine: string;
+  kokoro_voice_options: string[];
+  spell_engine_options: string[];
   llm_model: string;
   llm_options: Record<string, string>;
 }
@@ -52,6 +56,35 @@ export default function SettingsPage() {
             <Select value={cfg.tts_engine} onChange={(e) => save({ tts_engine: e.target.value })}>
               <option value="piper">Piper</option>
               <option value="kokoro">Kokoro</option>
+            </Select>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Kokoro Voice</CardTitle>
+            <CardDescription>Which Kokoro voice to use for narration (and for spelling, if matched below)</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <Label>Kokoro Voice</Label>
+            <Select value={cfg.kokoro_voice} onChange={(e) => save({ kokoro_voice: e.target.value })}>
+              {cfg.kokoro_voice_options.map((v) => (
+                <option key={v} value={v}>{v}</option>
+              ))}
+            </Select>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Spell-out Engine</CardTitle>
+            <CardDescription>Engine used for character-by-character spelling on Kokoro calls</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <Label>Spell-out Engine</Label>
+            <Select value={cfg.spell_engine} onChange={(e) => save({ spell_engine: e.target.value })}>
+              <option value="piper">Piper (default — clearer isolated characters)</option>
+              <option value="match">Match narration (Kokoro spells too — voice consistency test)</option>
             </Select>
           </CardContent>
         </Card>

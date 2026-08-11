@@ -64,6 +64,15 @@ PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.35"))
 # silence gaps injected between characters (SPELL_CHAR_GAP_MS), not from
 # stretching each word out.
 PIPER_SPELL_LENGTH_SCALE = float(os.getenv("PIPER_SPELL_LENGTH_SCALE", "1.4"))
+# Optional extra tuning knobs for the spelled-character voice only — leave
+# unset (None) to keep Piper's library defaults, which is what every voice
+# has been tuned against so far. Only touch these when experimenting with a
+# specific voice model that sounds flat/robotic in isolation; they do not
+# affect normal (non-spelled) narration.
+PIPER_SPELL_NOISE_SCALE = os.getenv("PIPER_SPELL_NOISE_SCALE")
+PIPER_SPELL_NOISE_SCALE = float(PIPER_SPELL_NOISE_SCALE) if PIPER_SPELL_NOISE_SCALE else None
+PIPER_SPELL_NOISE_W_SCALE = os.getenv("PIPER_SPELL_NOISE_W_SCALE")
+PIPER_SPELL_NOISE_W_SCALE = float(PIPER_SPELL_NOISE_W_SCALE) if PIPER_SPELL_NOISE_W_SCALE else None
 
 TTS_ENGINE = os.getenv("TTS_ENGINE", "piper")
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_bella")
@@ -71,14 +80,31 @@ KOKORO_RATE = 24000
 # <1.0 = slower (speed), 1.0 = normal
 KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "0.81"))
 KOKORO_DEVICE = os.getenv("KOKORO_DEVICE", "cuda")
-# Kokoro is NOT used for spelled-out characters — measured on real audio
-# that Kokoro's isolated single-word renders (e.g. "tee") come out both
-# less articulate and quieter than Piper's, and slowing them down below
-# ~1.0 speed breaks Kokoro's duration model outright (a bogus near-silent
-# gap inside the word). Piper measured clean on the same isolated-word
-# test in every dimension, so every spelled character goes through Piper
-# instead, even on a call that's otherwise using Kokoro — see
-# _spell_char_audio.
+# Speed for Kokoro when it IS used for spelled characters (SPELL_ENGINE=
+# "match" below). Same lesson as Piper's spell length-scale: stay close to
+# normal speed, since slowing Kokoro below ~1.0 breaks its duration model
+# (a bogus near-silent gap inside the word) — pacing comes from the real
+# silence gaps (SPELL_CHAR_GAP_MS), not from stretching the render.
+KOKORO_SPELL_SPEED = float(os.getenv("KOKORO_SPELL_SPEED", "1.0"))
+# Kokoro is NOT used for spelled-out characters by default — measured on
+# real audio (voice=af_bella) that Kokoro's isolated single-word renders
+# (e.g. "tee") come out both less articulate and quieter than Piper's.
+# Gain-boosting fixed the loudness (_SPELL_TARGET_PEAK) but not the
+# clarity, so every spelled character goes through Piper instead, even on
+# a call that's otherwise using Kokoro — see _spell_char_audio. Since that
+# was only ever measured against af_bella, set SPELL_ENGINE=match to
+# re-test it against a different Kokoro voice (e.g. af_heart): this makes
+# spelling use whatever engine/voice is doing the narration, so if that
+# voice's isolated-character quality holds up, the whole call — narration
+# AND spelling — becomes one single, fully consistent voice.
+SPELL_ENGINE = os.getenv("SPELL_ENGINE", "piper")  # "piper" or "match"
+# American voices worth A/B-ing from the settings UI. af_heart is Kokoro's
+# own recommended default and tests warmer/more natural than af_bella in
+# blind listening comparisons; the rest are other common built-in options.
+KOKORO_VOICE_OPTIONS = [
+    "af_bella", "af_heart", "af_sarah", "af_nicole", "af_sky",
+    "am_michael", "am_adam",
+]
 
 # Real silence injected between spelled-out characters/groups, so pacing
 # doesn't depend on how each engine happens to interpret punctuation.
@@ -360,22 +386,17 @@ async def _get_tts_lock():
     return _tts_lock
 
 
-# Measured on real audio: Kokoro's isolated single-word renders (what a
-# spelled-out character becomes, e.g. "tee") come out both quieter AND less
-# articulate than Piper's — gain-boosting the volume didn't fix clarity
-# because the underlying render itself is muddier, not just quiet. Piper's
-# isolated-word renders measured clean (continuous envelope, near-full-scale
-# volume) in the same tests. So EVERY spelled character is synthesized via
-# Piper, even on a call that's otherwise using Kokoro for normal speech —
-# use the engine that's actually good at this specific job.
-async def _spell_char_audio(tok: str, stop_event: "asyncio.Event | None" = None) -> bytes:
-    if stop_event is not None and stop_event.is_set():
-        return b""
+async def _piper_spell_char_audio(tok: str, stop_event: "asyncio.Event | None" = None) -> bytes:
     voice = state.get("piper_voice")
     if voice is None:
         return b""
     from piper.config import SynthesisConfig
-    cfg = SynthesisConfig(length_scale=PIPER_SPELL_LENGTH_SCALE)
+    cfg_kwargs = {"length_scale": PIPER_SPELL_LENGTH_SCALE}
+    if PIPER_SPELL_NOISE_SCALE is not None:
+        cfg_kwargs["noise_scale"] = PIPER_SPELL_NOISE_SCALE
+    if PIPER_SPELL_NOISE_W_SCALE is not None:
+        cfg_kwargs["noise_w_scale"] = PIPER_SPELL_NOISE_W_SCALE
+    cfg = SynthesisConfig(**cfg_kwargs)
     loop = asyncio.get_running_loop()
 
     async def synth():
@@ -391,6 +412,58 @@ async def _spell_char_audio(tok: str, stop_event: "asyncio.Event | None" = None)
         if stop_event is not None and stop_event.is_set():
             return b""
         return await _synth_char_bytes(synth(), label=tok, engine="piper")
+
+
+async def _kokoro_spell_char_audio(tok: str, stop_event: "asyncio.Event | None" = None,
+                                    kokoro_voice: str = KOKORO_VOICE) -> bytes:
+    """Experimental: spell a character through Kokoro itself (spell_engine=
+    match), so narration and spelling use the exact same voice. Only worth
+    using if the active kokoro_voice's isolated-word renders hold up — see
+    the SPELL_ENGINE comment above KOKORO_SPELL_SPEED."""
+    from audio import resample
+    pipeline = state.get("kokoro_pipeline")
+    if not pipeline:
+        return b""
+    loop = asyncio.get_running_loop()
+
+    async def synth():
+        gen = pipeline(_spoken_char(tok), voice=kokoro_voice, speed=KOKORO_SPELL_SPEED)
+        while True:
+            result = await loop.run_in_executor(None, _piper_next, gen)
+            if result is None:
+                break
+            if result.audio is None or len(result.audio) == 0:
+                continue
+            audio = result.audio
+            if KOKORO_RATE != PIPER_RATE:
+                audio = resample(audio, KOKORO_RATE, PIPER_RATE)
+            pcm = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+            yield pcm.tobytes()
+
+    lock = await _get_kokoro_lock()
+    async with lock:
+        if stop_event is not None and stop_event.is_set():
+            return b""
+        return await _synth_char_bytes(synth(), label=tok, engine="kokoro")
+
+
+# Measured on real audio: Kokoro's isolated single-word renders (what a
+# spelled-out character becomes, e.g. "tee") come out both quieter AND less
+# articulate than Piper's — gain-boosting the volume didn't fix clarity
+# because the underlying render itself is muddier, not just quiet. Piper's
+# isolated-word renders measured clean (continuous envelope, near-full-scale
+# volume) in the same tests. So by default EVERY spelled character is
+# synthesized via Piper, even on a call that's otherwise using Kokoro for
+# normal speech. Set SPELL_ENGINE=match to route spelling through whichever
+# engine is doing the narration instead (for re-testing Kokoro with a
+# different voice, e.g. af_heart).
+async def _spell_char_audio(engine: str, tok: str, stop_event: "asyncio.Event | None" = None,
+                             kokoro_voice: str = KOKORO_VOICE) -> bytes:
+    if stop_event is not None and stop_event.is_set():
+        return b""
+    if engine == "kokoro":
+        return await _kokoro_spell_char_audio(tok, stop_event=stop_event, kokoro_voice=kokoro_voice)
+    return await _piper_spell_char_audio(tok, stop_event=stop_event)
 
 
 # ── Piper TTS streaming ──────────────────────────────────────────────────
@@ -436,7 +509,7 @@ async def _piper_synth_segments(segments, stop_event: "asyncio.Event | None" = N
                 if tok == SPELL_PAUSE:
                     yield _silence_bytes(SPELL_GROUP_GAP_MS)
                     continue
-                audio = await _spell_char_audio(tok, stop_event=stop_event)
+                audio = await _spell_char_audio("piper", tok, stop_event=stop_event)
                 if audio:
                     yield audio
                 yield _silence_bytes(SPELL_CHAR_GAP_MS)
@@ -494,7 +567,8 @@ async def _get_kokoro_lock():
     return _kokoro_lock
 
 
-async def _kokoro_synth_segments(segments, stop_event: "asyncio.Event | None" = None):
+async def _kokoro_synth_segments(segments, stop_event: "asyncio.Event | None" = None,
+                                  kokoro_voice: str = KOKORO_VOICE, spell_engine: str = SPELL_ENGINE):
     from audio import resample
     pipeline = state.get("kokoro_pipeline")
     if not pipeline:
@@ -505,7 +579,7 @@ async def _kokoro_synth_segments(segments, stop_event: "asyncio.Event | None" = 
     loop = asyncio.get_running_loop()
 
     async def synth(t, speed):
-        gen = pipeline(t, voice=KOKORO_VOICE, speed=speed)
+        gen = pipeline(t, voice=kokoro_voice, speed=speed)
         while True:
             result = await loop.run_in_executor(None, _piper_next, gen)
             if result is None:
@@ -536,15 +610,18 @@ async def _kokoro_synth_segments(segments, stop_event: "asyncio.Event | None" = 
                             return
                         yield b
                 continue
-            # Spelled characters go through Piper, not Kokoro — see
-            # _spell_char_audio for why.
+            # Spelled characters go through Piper by default, not Kokoro —
+            # see _spell_char_audio for why. spell_engine="match" overrides
+            # this to keep spelling on Kokoro too (voice consistency test).
+            char_engine = "kokoro" if spell_engine == "match" else "piper"
             for tok in content:
                 if stop_event is not None and stop_event.is_set():
                     return
                 if tok == SPELL_PAUSE:
                     yield _silence_bytes(SPELL_GROUP_GAP_MS)
                     continue
-                audio = await _spell_char_audio(tok, stop_event=stop_event)
+                audio = await _spell_char_audio(char_engine, tok, stop_event=stop_event,
+                                                 kokoro_voice=kokoro_voice)
                 if audio:
                     yield audio
                 yield _silence_bytes(SPELL_CHAR_GAP_MS)
@@ -555,7 +632,11 @@ async def _kokoro_synth_segments(segments, stop_event: "asyncio.Event | None" = 
 async def kokoro_stream(text: str, stop_event: "asyncio.Event | None" = None):
     text = tts_text(text, "kokoro")
     segments = split_spell_segments(text)
-    async for chunk in _kokoro_synth_segments(segments, stop_event=stop_event):
+    cfg = await _get_config()
+    async for chunk in _kokoro_synth_segments(
+        segments, stop_event=stop_event,
+        kokoro_voice=cfg["kokoro_voice"], spell_engine=cfg["spell_engine"],
+    ):
         yield chunk
 
 
@@ -1660,6 +1741,8 @@ async def _get_config() -> dict:
         "tts_engine": cfg.get("tts_engine", TTS_ENGINE),
         "vad_mode": cfg.get("vad_mode", VAD_MODE),
         "stay_awake": cfg.get("stay_awake", "0"),
+        "kokoro_voice": cfg.get("kokoro_voice", KOKORO_VOICE),
+        "spell_engine": cfg.get("spell_engine", SPELL_ENGINE),
     }
 
 
@@ -1674,8 +1757,12 @@ async def get_config():
         "tts_engine": cfg["tts_engine"],
         "vad_mode": cfg["vad_mode"],
         "stay_awake": cfg["stay_awake"] == "1",
+        "kokoro_voice": cfg["kokoro_voice"],
+        "spell_engine": cfg["spell_engine"],
         "tts_options": ["piper", "kokoro"],
         "vad_options": ["silero", "rms"],
+        "kokoro_voice_options": KOKORO_VOICE_OPTIONS,
+        "spell_engine_options": ["piper", "match"],
         "llm_model": state["llm_model"],
         "llm_options": state["llm_options"],
     }
@@ -1695,6 +1782,14 @@ async def post_config(request: Request):
         updates["vad_mode"] = data["vad_mode"]
     if "stay_awake" in data:
         updates["stay_awake"] = "1" if data["stay_awake"] else "0"
+    if "kokoro_voice" in data:
+        if data["kokoro_voice"] not in KOKORO_VOICE_OPTIONS:
+            return JSONResponse({"error": f"kokoro_voice must be one of {KOKORO_VOICE_OPTIONS}"}, 400)
+        updates["kokoro_voice"] = data["kokoro_voice"]
+    if "spell_engine" in data:
+        if data["spell_engine"] not in ("piper", "match"):
+            return JSONResponse({"error": "spell_engine must be piper or match"}, 400)
+        updates["spell_engine"] = data["spell_engine"]
     if updates:
         await _set_config(**updates)
     return {"ok": True, "config": await _get_config()}
