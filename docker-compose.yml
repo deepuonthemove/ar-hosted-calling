@@ -108,10 +108,14 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE: ${PUBLIC_SCHEME:-https}://${PUBLIC_DOMAIN:-call.ar-voice.com}
+        NEXT_PUBLIC_OPIK_HOST: https://optik.${PUBLIC_DOMAIN:-call.ar-voice.com}
     container_name: frontend
     restart: unless-stopped
     environment:
       - NEXT_PUBLIC_API_BASE=${PUBLIC_SCHEME:-https}://${PUBLIC_DOMAIN:-call.ar-voice.com}
+      - NEXT_PUBLIC_OPIK_HOST=https://optik.${PUBLIC_DOMAIN:-call.ar-voice.com}
     ports:
       - "3000:3000"
     profiles: [prod, tls]
@@ -163,7 +167,7 @@ services:
     profiles: [opik]
 
   opik-backend:
-    image: ghcr.io/comet-ml/opik-backend:latest
+    image: ghcr.io/comet-ml/opik/opik-backend:latest
     container_name: opik-backend
     restart: unless-stopped
     ports:
@@ -182,7 +186,7 @@ services:
     profiles: [opik]
 
   opik-worker:
-    image: ghcr.io/comet-ml/opik-python-backend:latest
+    image: ghcr.io/comet-ml/opik/opik-python-backend:latest
     container_name: opik-worker
     restart: unless-stopped
     environment:
@@ -196,7 +200,7 @@ services:
     profiles: [opik]
 
   opik-frontend:
-    image: ghcr.io/comet-ml/opik-frontend:latest
+    image: ghcr.io/comet-ml/opik/opik-frontend:latest
     container_name: opik-frontend
     restart: unless-stopped
     ports:

@@ -213,7 +213,8 @@ def load_models():
         try:
             import opik as opik_sdk
             opik_sdk.configure(api_key=OPIK_API_KEY or "local", use_local=True,
-                               url_override=OPIK_BASE_URL, project_name="ar-voice-agent")
+                               url_override=OPIK_BASE_URL, project_name="ar-voice-agent",
+                               use_batching=False)
             opik_client = opik_sdk.Opik()
             state["opik"] = opik_client
             log.info("Opik enabled at %s", OPIK_BASE_URL)
