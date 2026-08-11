@@ -8,6 +8,14 @@ cd ~/ar-voice-agent
 # redis, frontend and caddy (TLS via Let's Encrypt for PUBLIC_DOMAIN).
 docker compose --profile prod --profile tls up -d --build
 
+# Opik runs as its own compose at /opt/opik (the built-in compose `opik`
+# profile is not the real stack). Start it too if present.
+if [ -d /opt/opik/deployment/docker-compose ]; then
+  (cd /opt/opik/deployment/docker-compose \
+    && sudo docker compose -f docker-compose.yaml -f docker-compose.override.yml \
+         --profile opik up -d)
+fi
+
 sleep 8
 echo "----------------------------------------"
 echo "  API health : curl https://\$(grep ^PUBLIC_DOMAIN .env | cut -d= -f2)/health"
