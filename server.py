@@ -89,8 +89,8 @@ KOKORO_SPELL_SPEED = float(os.getenv("KOKORO_SPELL_SPEED", "1.0"))
 # Kokoro is NOT used for spelled-out characters by default — measured on
 # real audio (voice=af_bella) that Kokoro's isolated single-word renders
 # (e.g. "tee") come out both less articulate and quieter than Piper's.
-# Gain-boosting fixed the loudness (_SPELL_TARGET_PEAK) but not the
-# clarity, so every spelled character goes through Piper instead, even on
+# Gain-boosting fixed the loudness (see _fade_edges' RMS matching) but not
+# the clarity, so every spelled character goes through Piper instead, even on
 # a call that's otherwise using Kokoro — see _spell_char_audio. Since that
 # was only ever measured against af_bella, set SPELL_ENGINE=match to
 # re-test it against a different Kokoro voice (e.g. af_heart): this makes
@@ -295,31 +295,53 @@ def _spoken_char(tok: str) -> str:
     return _LETTER_NAMES.get(tok.upper(), _DIGIT_NAMES.get(tok, tok))
 
 
-# Light safety-net fade for a clean splice into the surrounding silence.
+# Safety-net fade for a clean splice into the surrounding silence. A LINEAR
+# ramp has a sharp corner where it meets the un-faded audio (an instant
+# change in slope) — that corner is itself audible as a soft click/tick,
+# especially on the fade-out when it lands mid-consonant. A raised-cosine
+# (Hann) ramp has zero slope at both ends, so it blends into flat audio and
+# into silence with no corner — this is what actually kills the click, not
+# just the fade duration.
 _SPELL_FADE_MS = int(os.getenv("SPELL_FADE_MS", "12"))
 
-# Measured on real audio: Kokoro renders very short isolated words (e.g.
-# "tee" at -15dBFS, "es" at -13dBFS) noticeably quieter than normal
-# continuous speech (-6 to -8dBFS) — some spelled letters end up too quiet
-# to hear clearly. Boost each character's peak up to this target so it
-# matches normal speech loudness. Only ever boosts UP, never attenuates —
-# Piper's per-word output is already near full-scale, so this is a no-op
-# for it and only helps Kokoro's quieter renders.
-_SPELL_TARGET_PEAK = int(os.getenv("SPELL_TARGET_PEAK", "22000"))
+# Measured on real audio: an isolated single-word render (what a spelled
+# character becomes, e.g. "tee") comes out noticeably quieter than normal
+# continuous speech — peak-matching alone doesn't fix this because peak
+# only reflects the single loudest sample, not how loud the character
+# *sounds* over its duration (a short sharp transient can peak-match normal
+# speech and still sound quiet). RMS (average energy) tracks perceived
+# loudness much better, so each character is scaled to match the RMS of the
+# narration immediately preceding it in the same response — measured live,
+# per call, per voice — rather than a fixed guessed constant. This target is
+# the fallback only for a response that opens with a spelled run before any
+# narration has played yet.
+_SPELL_TARGET_RMS = float(os.getenv("SPELL_TARGET_RMS", "6000"))
+# Cap how hard a near-silent render can be amplified — otherwise a mostly-
+# silent glitch chunk would get boosted into a loud burst of noise.
+_SPELL_MAX_GAIN = float(os.getenv("SPELL_MAX_GAIN", "6.0"))
+
+
+def _rms(arr: np.ndarray) -> float:
+    if len(arr) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(arr))))
 
 
 def _fade_edges(pcm_bytes: bytes, fade_ms: int = _SPELL_FADE_MS,
-                 target_peak: int = _SPELL_TARGET_PEAK) -> bytes:
+                 target_rms: float | None = None) -> bytes:
     if not pcm_bytes:
         return pcm_bytes
     arr = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
-    peak = np.abs(arr).max()
-    if 0 < peak < target_peak:
-        arr = np.clip(arr * (target_peak / peak), -32767, 32767)
+    rms = _rms(arr)
+    target = target_rms if target_rms else _SPELL_TARGET_RMS
+    if rms > 0 and target > 0:
+        gain = min(target / rms, _SPELL_MAX_GAIN)
+        arr = np.clip(arr * gain, -32767, 32767)
     n = len(arr)
     fade_n = min(int(PIPER_RATE * fade_ms / 1000), n // 2)
     if fade_n > 0:
-        ramp = np.linspace(0.0, 1.0, fade_n, dtype=np.float32)
+        # Raised-cosine (Hann) half-window: starts/ends at zero slope.
+        ramp = 0.5 - 0.5 * np.cos(np.linspace(0.0, np.pi, fade_n, dtype=np.float32))
         arr[:fade_n] *= ramp
         arr[-fade_n:] *= ramp[::-1]
     return arr.astype(np.int16).tobytes()
@@ -350,7 +372,8 @@ BROWSER_BASELINE_FRAMES = int(os.getenv("BROWSER_BASELINE_FRAMES", "25"))
 
 
 async def _synth_char_bytes(char_gen, label: str = "?", engine: str = "?",
-                             timeout: float = SPELL_CHAR_TIMEOUT_S) -> bytes:
+                             timeout: float = SPELL_CHAR_TIMEOUT_S,
+                             target_rms: float | None = None) -> bytes:
     """Buffer one spelled character's audio (always short) and fade its
     edges, instead of streaming it raw — removes the click/static pop that a
     fresh isolated synth call produces at onset. Bounded by `timeout` so a
@@ -371,7 +394,7 @@ async def _synth_char_bytes(char_gen, label: str = "?", engine: str = "?",
         return b""
     elapsed_ms = (time.time() - t0) * 1000
     log.info("[spell] %s char %r: %.0fms", engine, label, elapsed_ms)
-    return _fade_edges(buf)
+    return _fade_edges(buf, target_rms=target_rms)
 
 
 # Serializes in-process Piper synthesis. The shared ONNX session is not safe
@@ -386,7 +409,8 @@ async def _get_tts_lock():
     return _tts_lock
 
 
-async def _piper_spell_char_audio(tok: str, stop_event: "asyncio.Event | None" = None) -> bytes:
+async def _piper_spell_char_audio(tok: str, stop_event: "asyncio.Event | None" = None,
+                                   target_rms: float | None = None) -> bytes:
     voice = state.get("piper_voice")
     if voice is None:
         return b""
@@ -411,11 +435,12 @@ async def _piper_spell_char_audio(tok: str, stop_event: "asyncio.Event | None" =
     async with lock:
         if stop_event is not None and stop_event.is_set():
             return b""
-        return await _synth_char_bytes(synth(), label=tok, engine="piper")
+        return await _synth_char_bytes(synth(), label=tok, engine="piper", target_rms=target_rms)
 
 
 async def _kokoro_spell_char_audio(tok: str, stop_event: "asyncio.Event | None" = None,
-                                    kokoro_voice: str = KOKORO_VOICE) -> bytes:
+                                    kokoro_voice: str = KOKORO_VOICE,
+                                    target_rms: float | None = None) -> bytes:
     """Experimental: spell a character through Kokoro itself (spell_engine=
     match), so narration and spelling use the exact same voice. Only worth
     using if the active kokoro_voice's isolated-word renders hold up — see
@@ -444,7 +469,7 @@ async def _kokoro_spell_char_audio(tok: str, stop_event: "asyncio.Event | None" 
     async with lock:
         if stop_event is not None and stop_event.is_set():
             return b""
-        return await _synth_char_bytes(synth(), label=tok, engine="kokoro")
+        return await _synth_char_bytes(synth(), label=tok, engine="kokoro", target_rms=target_rms)
 
 
 # Measured on real audio: Kokoro's isolated single-word renders (what a
@@ -458,12 +483,14 @@ async def _kokoro_spell_char_audio(tok: str, stop_event: "asyncio.Event | None" 
 # engine is doing the narration instead (for re-testing Kokoro with a
 # different voice, e.g. af_heart).
 async def _spell_char_audio(engine: str, tok: str, stop_event: "asyncio.Event | None" = None,
-                             kokoro_voice: str = KOKORO_VOICE) -> bytes:
+                             kokoro_voice: str = KOKORO_VOICE,
+                             target_rms: float | None = None) -> bytes:
     if stop_event is not None and stop_event.is_set():
         return b""
     if engine == "kokoro":
-        return await _kokoro_spell_char_audio(tok, stop_event=stop_event, kokoro_voice=kokoro_voice)
-    return await _piper_spell_char_audio(tok, stop_event=stop_event)
+        return await _kokoro_spell_char_audio(tok, stop_event=stop_event, kokoro_voice=kokoro_voice,
+                                               target_rms=target_rms)
+    return await _piper_spell_char_audio(tok, stop_event=stop_event, target_rms=target_rms)
 
 
 # ── Piper TTS streaming ──────────────────────────────────────────────────
@@ -492,16 +519,26 @@ async def _piper_synth_segments(segments, stop_event: "asyncio.Event | None" = N
                     break
                 yield chunk.audio_int16_bytes
 
+        # Track the RMS of the most recent plain-narration segment so
+        # spelled characters that follow it can be loudness-matched to what
+        # this call actually sounds like, instead of a fixed guess.
+        last_rms = None
         for is_spell, content in segments:
             if stop_event is not None and stop_event.is_set():
                 return
             if not is_spell:
+                sumsq, count = 0.0, 0
                 lock = await _get_tts_lock()
                 async with lock:
                     async for b in synth(content, cfg_normal):
                         if stop_event is not None and stop_event.is_set():
                             return
+                        arr = np.frombuffer(b, dtype=np.int16).astype(np.float64)
+                        sumsq += float(np.sum(arr * arr))
+                        count += len(arr)
                         yield b
+                if count:
+                    last_rms = (sumsq / count) ** 0.5
                 continue
             for tok in content:
                 if stop_event is not None and stop_event.is_set():
@@ -509,7 +546,7 @@ async def _piper_synth_segments(segments, stop_event: "asyncio.Event | None" = N
                 if tok == SPELL_PAUSE:
                     yield _silence_bytes(SPELL_GROUP_GAP_MS)
                     continue
-                audio = await _spell_char_audio("piper", tok, stop_event=stop_event)
+                audio = await _spell_char_audio("piper", tok, stop_event=stop_event, target_rms=last_rms)
                 if audio:
                     yield audio
                 yield _silence_bytes(SPELL_CHAR_GAP_MS)
@@ -599,16 +636,26 @@ async def _kokoro_synth_segments(segments, stop_event: "asyncio.Event | None" = 
         # NEXT unit of work immediately, rather than waiting on asyncio
         # task-cancellation timing (see _piper_synth_segments for why that
         # matters on a long spelled run).
+        # Track the RMS of the most recent plain-narration segment so
+        # spelled characters that follow it can be loudness-matched to what
+        # this call actually sounds like, instead of a fixed guess.
+        last_rms = None
         for is_spell, content in segments:
             if stop_event is not None and stop_event.is_set():
                 return
             if not is_spell:
+                sumsq, count = 0.0, 0
                 lock = await _get_kokoro_lock()
                 async with lock:
                     async for b in synth(content, KOKORO_SPEED):
                         if stop_event is not None and stop_event.is_set():
                             return
+                        arr = np.frombuffer(b, dtype=np.int16).astype(np.float64)
+                        sumsq += float(np.sum(arr * arr))
+                        count += len(arr)
                         yield b
+                if count:
+                    last_rms = (sumsq / count) ** 0.5
                 continue
             # Spelled characters go through Piper by default, not Kokoro —
             # see _spell_char_audio for why. spell_engine="match" overrides
@@ -621,7 +668,7 @@ async def _kokoro_synth_segments(segments, stop_event: "asyncio.Event | None" = 
                     yield _silence_bytes(SPELL_GROUP_GAP_MS)
                     continue
                 audio = await _spell_char_audio(char_engine, tok, stop_event=stop_event,
-                                                 kokoro_voice=kokoro_voice)
+                                                 kokoro_voice=kokoro_voice, target_rms=last_rms)
                 if audio:
                     yield audio
                 yield _silence_bytes(SPELL_CHAR_GAP_MS)
