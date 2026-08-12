@@ -60,6 +60,21 @@ fi
 echo "===== [3/5] Build & start main stack (prod+tls) ====="
 docker compose --profile prod --profile tls up -d --build
 
+echo "----- Piper model check (baked-in download can silently fail) -----"
+if ! docker exec voice-agent ls /models/piper/en_US-lessac-medium.onnx >/dev/null 2>&1; then
+  echo ">> Piper model missing in the piper-models volume — downloading into it ..."
+  docker run --rm -v ar-voice-agent_piper-models:/models/piper alpine sh -c \
+    'apk add --no-cache wget >/dev/null 2>&1; \
+     wget -q -O /models/piper/en_US-lessac-medium.onnx \
+       https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx && \
+     wget -q -O /models/piper/en_US-lessac-medium.onnx.json \
+       https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json' \
+    && echo ">> Piper model downloaded." || echo ">> WARNING: Piper download failed — copy en_US-lessac-medium.onnx(+.json) into the piper-models volume."
+  docker restart voice-agent >/dev/null 2>&1 || true
+fi
+docker exec voice-agent ls /models/piper/en_US-lessac-medium.onnx >/dev/null 2>&1 \
+  && echo "Piper model: OK" || echo "Piper model: MISSING"
+
 echo "===== [4/5] Full Opik stack ====="
 if [ ! -d /opt/opik/deployment/docker-compose ]; then
   echo ">> Cloning Opik (deployment compose) ..."
@@ -70,10 +85,10 @@ if [ ! -d /opt/opik/deployment/docker-compose ]; then
   rm -rf /tmp/opik-bootstrap
 fi
 cd /opt/opik/deployment/docker-compose
-# Ensure the override remaps the backend to host port 8083 (the app expects it)
+# Ensure the override remaps the backend to host port 8083, disables auth,
+# and joins the app network so Caddy + the SDK can reach the frontend.
 if [ -f docker-compose.override.yml ] && ! grep -q '8083' docker-compose.override.yml 2>/dev/null; then
-  sudo tee -a docker-compose.override.yml >/dev/null <<'EOF'
-
+  sudo tee docker-compose.override.yml >/dev/null <<EOF
 services:
   backend:
     ports:
@@ -81,18 +96,29 @@ services:
     environment:
       TOGGLE_OPIK_AI_ENABLED: "true"
       TOGGLE_AGENTS_ENABLED: "true"
+      TOGGLE_GUARDRAILS_ENABLED: "false"
+      AUTH_ENABLED: "false"
   demo-data-generator:
     environment:
       CREATE_DEMO_DATA: "false"
+  frontend:
+    networks:
+      - default
+      - ar-voice-agent_default
+
+networks:
+  ar-voice-agent_default:
+    external: true
 EOF
 fi
 sudo docker compose -f docker-compose.yaml -f docker-compose.override.yml --profile opik up -d
 # Let the app's Caddy reach the Opik frontend (different docker network).
 sudo docker network connect ar-voice-agent_default opik-frontend-1 2>/dev/null || true
-# Point the app at the Opik backend via the docker gateway (host port 8083).
+# Point the app at the Opik FRONTEND via the docker gateway (host port 5173).
+# The SDK talks to the frontend, which proxies /api to the backend.
 GATEWAY=$(docker network inspect ar-voice-agent_default --format '{{(index .IPAM.Config 0).Gateway}}')
 cd "$APP_DIR"
-sed -i "s|^OPIK_BASE_URL=.*|OPIK_BASE_URL=http://${GATEWAY}:8083|" .env
+sed -i "s|^OPIK_BASE_URL=.*|OPIK_BASE_URL=http://${GATEWAY}:5173|" .env
 docker compose --profile prod up -d --force-recreate voice-agent
 
 echo "===== [5/5] Shutdown timer (auto-deactivate) ====="

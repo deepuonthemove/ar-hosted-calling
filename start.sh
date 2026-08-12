@@ -1,12 +1,12 @@
 #!/bin/bash
-# Start the AR voice agent stack (modern: prod + TLS via Caddy, no ngrok).
-# Use bootstrap-new-vm.sh on a fresh VM; this is the everyday start command.
+# Start the AR voice agent stack instantly (no rebuild — uses existing images).
+# Use bootstrap-new-vm.sh on a fresh VM; run rebuild.sh after changing code.
 set -e
 cd ~/ar-voice-agent
 
-# --build picks up any code changes; prod+tls brings up voice-agent, vllm,
-# redis, frontend and caddy (TLS via Let's Encrypt for PUBLIC_DOMAIN).
-docker compose --profile prod --profile tls up -d --build
+# prod+tls brings up voice-agent, vllm, redis, frontend and caddy. No --build:
+# instant start from cached images.
+docker compose --profile prod --profile tls up -d
 
 # Opik runs as its own compose at /opt/opik (the built-in compose `opik`
 # profile is not the real stack). Start it too if present.

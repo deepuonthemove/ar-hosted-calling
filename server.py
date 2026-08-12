@@ -212,10 +212,12 @@ def load_models():
     if OPIK_ENABLED:
         try:
             import opik as opik_sdk
+            # Batching can silently drop fast traces (create → end within the
+            # batch window). Disable it on the client so every trace/span is
+            # sent immediately.
             opik_sdk.configure(api_key=OPIK_API_KEY or "local", use_local=True,
-                               url_override=OPIK_BASE_URL, project_name="ar-voice-agent",
-                               use_batching=False)
-            opik_client = opik_sdk.Opik()
+                               url_override=OPIK_BASE_URL, project_name="ar-voice-agent")
+            opik_client = opik_sdk.Opik(batching=False)
             state["opik"] = opik_client
             log.info("Opik enabled at %s", OPIK_BASE_URL)
         except Exception as e:

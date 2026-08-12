@@ -3,6 +3,7 @@ services:
   vllm:
     image: vllm/vllm-openai:latest
     container_name: vllm
+    restart: unless-stopped
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -32,6 +33,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: redis
+    restart: unless-stopped
     command: redis-server --appendonly yes
     volumes:
       - redis-data:/data
@@ -76,6 +78,7 @@ services:
       context: .
       dockerfile: Dockerfile.server
     container_name: voice-agent
+    restart: unless-stopped
     runtime: nvidia
     env_file: .env
     environment:
