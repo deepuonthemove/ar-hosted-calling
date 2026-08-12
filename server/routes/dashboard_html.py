@@ -1,0 +1,478 @@
+"""Fallback legacy dashboard HTML, used when static/dashboard.html isn't present."""
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html><head><title>AR Voice Agent — Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}.live{animation:pulse 2s infinite}</style></head>
+<body class="bg-gray-900 text-gray-100 p-6">
+<div class="max-w-7xl mx-auto">
+  <div class="flex justify-between items-center mb-6">
+    <h1 class="text-3xl font-bold">Healthcare AR Voice Agent
+      <span class="text-green-400 text-sm live">● ON-PREM</span></h1>
+    <div class="flex gap-2">
+      <a href="/api/export-excel" class="px-3 py-2 bg-green-700 rounded text-sm font-bold">Export Excel</a>
+      <a href="/export.csv" class="px-3 py-2 bg-gray-700 rounded text-sm font-bold">Export CSV</a>
+    </div>
+  </div>
+  <div class="flex gap-2 mb-4">
+    <button id="tab-main" onclick="switchTab('main')"
+      class="px-4 py-2 rounded text-sm font-bold bg-blue-600">📊 Dashboard</button>
+    <button id="tab-review" onclick="switchTab('review')"
+      class="px-4 py-2 rounded text-sm font-bold bg-gray-800">🔍 Call Review</button>
+  </div>
+  <div id="view-main">
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+    <div class="space-y-6">
+      <div class="bg-gray-800 p-6 rounded-lg">
+        <h2 class="text-lg font-bold mb-4">Outbound Call Control
+          <span id="badge" class="text-xs text-blue-400 font-normal block">No account loaded</span></h2>
+        <form id="call-form" class="space-y-4">
+          <input type="hidden" id="account_uid">
+          <input id="phone" placeholder="+15551234567" required
+            class="w-full bg-gray-900 border border-gray-700 rounded p-2 text-sm">
+          <input id="payer" placeholder="Aetna"
+            class="w-full bg-gray-900 border border-gray-700 rounded p-2 text-sm">
+          <input id="claim_id" placeholder="CLM-90210"
+            class="w-full bg-gray-900 border border-gray-700 rounded p-2 text-sm">
+          <button class="w-full bg-blue-600 hover:bg-blue-500 font-bold p-2 rounded text-sm">
+            Place Outbound Call</button>
+        </form>
+        <div id="msg" class="mt-3 text-xs hidden"></div>
+      </div>
+
+      <!-- VAD Engine Selector -->
+      <div class="bg-gray-800 p-4 rounded-lg">
+        <label class="text-xs text-gray-400 block mb-1">VAD Engine</label>
+        <select id="vad-engine" class="w-full bg-gray-900 border border-gray-700 rounded p-2 text-sm">
+          <option value="silero">Silero (neural)</option>
+          <option value="rms">Plain RMS (energy)</option>
+        </select>
+      </div>
+
+      <!-- TTS Engine Selector -->
+      <div class="bg-gray-800 p-4 rounded-lg">
+        <label class="text-xs text-gray-400 block mb-1">TTS Engine</label>
+        <select id="tts-engine" class="w-full bg-gray-900 border border-gray-700 rounded p-2 text-sm">
+          <option value="piper">Piper (fast, robotic)</option>
+          <option value="kokoro">Kokoro (natural)</option>
+        </select>
+      </div>
+
+      <!-- LLM Model Selector -->
+      <div class="bg-gray-800 p-4 rounded-lg">
+        <label class="text-xs text-gray-400 block mb-1">LLM Model</label>
+        <div class="flex gap-2">
+          <select id="llm-model" class="flex-1 bg-gray-900 border border-gray-700 rounded p-2 text-sm"></select>
+          <button id="switch-llm-btn" onclick="switchLLM()"
+            class="px-3 py-1 bg-yellow-700 hover:bg-yellow-600 rounded text-xs font-bold disabled:opacity-50"
+            disabled>Switch</button>
+        </div>
+        <div id="llm-status" class="mt-1 text-xs text-gray-500"></div>
+      </div>
+
+      <!-- Browser Call Button -->
+      <button id="browser-call-btn" onclick="toggleBrowserCall()"
+        class="w-full bg-green-700 hover:bg-green-600 font-bold p-3 rounded text-sm transition duration-200">
+        🎤 Call from Browser
+      </button>
+
+      <!-- Browser Call Panel (hidden by default) -->
+      <div id="browser-call-panel" class="bg-gray-800 rounded-lg p-4 hidden">
+        <div class="flex justify-between items-center mb-3">
+          <h2 class="text-lg font-bold">🟢 Live Browser Call</h2>
+          <button onclick="endBrowserCall()"
+            class="px-3 py-1 bg-red-700 hover:bg-red-600 rounded text-xs font-bold">End Call</button>
+        </div>
+        <div id="browser-log" class="h-48 overflow-y-auto bg-gray-900 rounded p-3 text-xs font-mono space-y-1"></div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-4">
+        <div class="bg-gray-800 p-4 rounded-lg"><div class="text-sm text-gray-400">Calls</div>
+          <div id="calls-today" class="text-2xl font-bold">0</div></div>
+        <div class="bg-gray-800 p-4 rounded-lg"><div class="text-sm text-gray-400">Success</div>
+          <div id="success-rate" class="text-2xl font-bold">0%</div></div>
+        <div class="bg-gray-800 p-4 rounded-lg"><div class="text-sm text-gray-400">Avg Duration</div>
+          <div id="avg-dur" class="text-2xl font-bold">0m</div></div>
+        <div class="bg-gray-800 p-4 rounded-lg"><div class="text-sm text-gray-400">Cost/min</div>
+          <div class="text-2xl font-bold">$0.00</div></div>
+      </div>
+      <div class="bg-gray-800 rounded-lg p-4">
+        <h2 class="text-lg font-bold mb-3">Live Call Feed</h2>
+        <div id="call-rows" class="space-y-3 max-h-[300px] overflow-y-auto"></div>
+      </div>
+    </div>
+    <div class="lg:col-span-2 space-y-6">
+      <div class="bg-gray-800 p-6 rounded-lg">
+        <h2 class="text-lg font-bold mb-2">Excel Calling Context List</h2>
+        <form id="upload-form" class="flex gap-4 items-center mt-4">
+          <input type="file" id="excel-file" accept=".xlsx" required class="text-sm">
+          <button class="px-4 py-2 bg-blue-600 rounded text-sm font-bold">Upload</button>
+        </form>
+        <div id="upload-msg" class="mt-3 text-xs hidden"></div>
+      </div>
+      <div class="bg-gray-800 rounded-lg overflow-hidden">
+        <div class="p-4 border-b border-gray-700 flex justify-between">
+          <h2 class="text-lg font-bold">Calling Checklist</h2>
+          <span id="acct-count" class="text-xs text-gray-400">0 Accounts</span></div>
+        <div class="overflow-x-auto max-h-[500px] overflow-y-auto">
+          <table class="w-full text-sm">
+            <thead class="bg-gray-700 sticky top-0"><tr>
+              <th class="text-left p-3">Patient</th><th class="text-left p-3">Payer</th>
+              <th class="text-left p-3">DOS</th><th class="text-left p-3">Billed</th>
+              <th class="text-left p-3">Objective</th><th class="text-left p-3">Outcome</th>
+              <th class="text-left p-3">Status</th><th class="text-left p-3"></th></tr></thead>
+            <tbody id="acct-rows" class="divide-y divide-gray-700">
+              <tr><td colspan="8" class="p-6 text-center text-gray-500">Upload an Excel file.</td></tr>
+            </tbody></table></div></div>
+    </div>
+  </div>
+  </div>
+
+  <!-- Call Review View (separate tab) -->
+  <div id="view-review" class="hidden">
+    <div class="bg-gray-800 rounded-lg p-4">
+      <div class="flex justify-between items-center mb-3">
+        <h2 class="text-lg font-bold">Call Review
+          <span class="text-xs text-gray-400 font-normal">(browser calls only)</span></h2>
+        <button onclick="switchTab('main')" class="px-3 py-1 bg-gray-700 rounded text-xs">← Back to Dashboard</button>
+      </div>
+      <div id="review-list" class="space-y-2 max-h-[400px] overflow-y-auto"></div>
+      <div id="review-detail" class="hidden mt-4 border-t border-gray-700 pt-4">
+        <div class="flex justify-between items-center mb-3">
+          <h3 class="text-md font-bold">Transcript Comparison</h3>
+          <button onclick="closeReview()" class="px-2 py-1 bg-gray-700 rounded text-xs">✕ Close</button>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="bg-gray-900 rounded p-3">
+            <div class="text-xs text-blue-300 font-bold mb-2">🔴 Real-Time STT (with VAD)</div>
+            <div id="review-real-time" class="text-xs leading-relaxed whitespace-pre-wrap"></div>
+          </div>
+          <div class="bg-gray-900 rounded p-3">
+            <div class="text-xs text-green-300 font-bold mb-2">🟢 Full Recording STT (no VAD)</div>
+            <div id="review-full-audio" class="text-xs leading-relaxed whitespace-pre-wrap"></div>
+          </div>
+        </div>
+        <div class="mt-3 bg-gray-900 rounded p-3">
+          <div class="text-xs text-orange-300 font-bold mb-2">🤖 AI Responses</div>
+          <div id="review-ai-responses" class="text-xs leading-relaxed whitespace-pre-wrap"></div>
+        </div>
+        <div class="mt-2 text-[10px] text-gray-500" id="review-meta"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+let stats = {total: 0, success: 0};
+
+async function fetchCalls() {
+  const calls = await (await fetch('/api/calls')).json();
+  $('call-rows').innerHTML = '';
+  stats = {total: 0, success: 0};
+  let durSum = 0, durN = 0;
+  calls.forEach(c => {
+    stats.total++;
+    if (c.status === 'completed') stats.success++;
+    if (c.duration_ms) { durSum += +c.duration_ms; durN++; }
+    const color = c.status==='completed'?'bg-green-900 text-green-300'
+      : c.status==='failed'?'bg-red-900 text-red-300':'bg-yellow-900 text-yellow-300';
+    $('call-rows').insertAdjacentHTML('afterbegin', `
+      <div class="p-3 bg-gray-900 rounded border border-gray-700">
+        <div class="flex justify-between"><b class="text-xs">${c.payer||'Unknown'}</b>
+        <span class="px-1.5 py-0.5 rounded text-[10px] ${color}">${c.status}</span></div>
+        <div class="text-[11px] text-gray-400 mt-1">Claim: ${c.claim_id||'-'}
+          ${c.amount?'<br>Billed: $'+c.amount:''}
+          ${c.next_action?'<br>Action: '+c.next_action:''}
+          ${c.last_error?'<br><span class="text-red-400">'+c.last_error+'</span>':''}
+        </div></div>`);
+  });
+  $('calls-today').textContent = stats.total;
+  $('success-rate').textContent = stats.total ? Math.round(stats.success/stats.total*100)+'%' : '0%';
+  $('avg-dur').textContent = durN ? Math.round(durSum/durN/60000*10)/10+'m' : '0m';
+}
+
+async function fetchAccounts() {
+  const accts = await (await fetch('/api/accounts')).json();
+  $('acct-count').textContent = accts.length + ' Accounts';
+  if (!accts.length) return;
+  $('acct-rows').innerHTML = '';
+  accts.forEach(a => {
+    const st = a['Call Status']||'Pending';
+    const color = st==='Calls Done'?'bg-green-950 text-green-300'
+      : (st==='Failed'||st==='Disconnected')?'bg-red-950 text-red-300':'bg-gray-700';
+    $('acct-rows').insertAdjacentHTML('beforeend', `<tr class="hover:bg-gray-700">
+      <td class="p-3 font-semibold">${a['Patient Name']||'-'}</td>
+      <td class="p-3">${a['Responsible Payer']||''}</td>
+      <td class="p-3 text-gray-400">${(a['DOS']||'').slice(0,10)}</td>
+      <td class="p-3">${a['Billed Amount']?'$'+a['Billed Amount']:'-'}</td>
+      <td class="p-3 text-xs text-gray-400 max-w-xs truncate">${a['AR Final Comments']||'-'}</td>
+      <td class="p-3 text-xs max-w-xs truncate">${a['Call Comments']||'-'}</td>
+      <td class="p-3"><span class="px-2 py-0.5 rounded text-[10px] font-bold ${color}">${st}</span></td>
+      <td class="p-3"><button onclick="pick('${a.UID}','${(a['Patient Name']||'').replace(/'/g,"")}','${a['Responsible Payer']||''}','${a['Account Number']||''}')"
+        class="px-2 py-1 bg-blue-600 rounded text-xs font-bold">Load</button></td></tr>`);
+  });
+}
+
+function pick(uid, name, payer, claim) {
+  $('account_uid').value = uid; $('payer').value = payer; $('claim_id').value = claim;
+  $('badge').textContent = 'Loaded: ' + name;
+}
+
+$('upload-form').onsubmit = async e => {
+  e.preventDefault();
+  const fd = new FormData();
+  fd.append('file', $('excel-file').files[0]);
+  const res = await fetch('/api/upload-excel', {method: 'POST', body: fd});
+  const d = await res.json();
+  $('upload-msg').classList.remove('hidden');
+  $('upload-msg').textContent = res.ok ? `Loaded ${d.count} accounts` : 'Error: ' + d.error;
+  $('upload-msg').className = 'mt-3 text-xs ' + (res.ok ? 'text-green-400' : 'text-red-400');
+  fetchAccounts();
+};
+
+$('call-form').onsubmit = async e => {
+  e.preventDefault();
+  const res = await fetch('/make-call', {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({phone: $('phone').value, payer: $('payer').value,
+      claim_id: $('claim_id').value, account_uid: $('account_uid').value})});
+  const d = await res.json();
+  $('msg').classList.remove('hidden');
+  $('msg').textContent = res.ok ? 'Call triggered: ' + d.callSid : 'Error: ' + d.error;
+  $('msg').className = 'mt-3 text-xs ' + (res.ok ? 'text-green-400' : 'text-red-400');
+};
+
+fetchAccounts(); fetchCalls();
+setInterval(fetchCalls, 3000);
+setInterval(fetchAccounts, 5000);
+
+// ── Browser Call ──────────────────────────────────────────────────────
+let bcWS = null, bcMic = null, bcCtx = null, bcSrc = null, bcProc = null;
+let bcPlayCtx = null, bcAudioQ = [], bcPlaying = false, bcCurSrc = null;
+let bcLogEl = null;
+
+function bcLog(msg, cls) {
+  const d = document.createElement('div');
+  d.textContent = msg;
+  if (cls) d.className = cls;
+  if (bcLogEl) { bcLogEl.appendChild(d); bcLogEl.scrollTop = bcLogEl.scrollHeight; }
+}
+
+function toggleBrowserCall() {
+  if (bcWS && bcWS.readyState === WebSocket.OPEN) { endBrowserCall(); return; }
+  startBrowserCall();
+}
+
+function endBrowserCall() {
+  if (bcPlayCtx) { bcPlayCtx.close(); bcPlayCtx = null; }
+  if (bcProc) { bcProc.disconnect(); bcProc = null; }
+  if (bcSrc) { bcSrc.disconnect(); bcSrc = null; }
+  if (bcMic) { bcMic.getTracks().forEach(t => t.stop()); bcMic = null; }
+  if (bcCtx) { bcCtx.close(); bcCtx = null; }
+  if (bcWS) { bcWS.close(); bcWS = null; }
+  bcAudioQ = []; bcPlaying = false; bcCurSrc = null;
+  $('browser-call-panel').classList.add('hidden');
+  $('browser-call-btn').textContent = '🎤 Call from Browser';
+  $('browser-call-btn').className = 'w-full bg-green-700 hover:bg-green-600 font-bold p-3 rounded text-sm';
+}
+
+async function startBrowserCall() {
+  const sid = 'browser_' + Math.random().toString(36).slice(2);
+  const uid = ($('account_uid') && $('account_uid').value) || '';
+  const tts = ($('tts-engine') && $('tts-engine').value) || 'piper';
+  const vad = ($('vad-engine') && $('vad-engine').value) || 'silero';
+  const params = new URLSearchParams();
+  if (uid) params.set('account_uid', uid);
+  params.set('tts', tts);
+  params.set('vad', vad);
+  bcPlayCtx = new AudioContext(); // create inside user gesture — ensures running state
+  bcWS = new WebSocket('wss://' + location.host + '/ws/' + sid + '?' + params.toString());
+  bcWS.binaryType = 'arraybuffer';
+
+  $('browser-call-panel').classList.remove('hidden');
+  bcLogEl = $('browser-log');
+  bcLogEl.innerHTML = '<div class="text-green-400">Connecting...</div>';
+  $('browser-call-btn').textContent = '🔴 End Browser Call';
+  $('browser-call-btn').className = 'w-full bg-red-700 hover:bg-red-600 font-bold p-3 rounded text-sm';
+
+  bcWS.onopen = async () => {
+    bcLog('Connected — starting mic...', 'text-green-400');
+    try {
+      bcCtx = new AudioContext({ sampleRate: 16000 });
+      bcMic = await navigator.mediaDevices.getUserMedia({ audio: true });
+      bcSrc = bcCtx.createMediaStreamSource(bcMic);
+      bcProc = bcCtx.createScriptProcessor(4096, 1, 1);
+      bcProc.onaudioprocess = e => {
+        if (!bcWS || bcWS.readyState !== 1) return;
+        const inp = e.inputBuffer.getChannelData(0);
+        const b = new Int16Array(inp.length);
+        for (let i = 0; i < inp.length; i++) b[i] = Math.max(-32768, Math.min(32767, inp[i] * 32768));
+        bcWS.send(b.buffer);
+      };
+      bcSrc.connect(bcProc);
+      bcProc.connect(bcCtx.destination);
+      bcLog('✅ Mic active — speak now', 'text-green-400');
+    } catch (e) {
+      bcLog('❌ Mic error: ' + e.message, 'text-red-400');
+    }
+  };
+
+  bcWS.onmessage = e => {
+    if (typeof e.data === 'string') {
+      const m = JSON.parse(e.data);
+      if (m.type === 'config') { bcPlayCtx = new AudioContext(); return; }
+      bcLog(m.text, m.type === 'transcript' ? 'text-blue-300' : 'text-orange-300');
+    } else {
+      const v = new Uint8Array(e.data);
+      if (v[0] === 1) { bcAudioQ.push(v.slice(1)); if (!bcPlaying) bcPlayNext(); }
+      else if (v[0] === 2) { bcAudioQ = []; if (bcPlaying && bcCurSrc) { bcPlaying = false; try { bcCurSrc.stop(); } catch (e) {} } }
+    }
+  };
+
+  bcWS.onclose = () => {
+    bcLogEl.innerHTML += '<div class="text-gray-500">Disconnected.</div>';
+    endBrowserCall();
+  };
+}
+
+function bcPlayNext() {
+  if (!bcAudioQ.length || !bcPlayCtx) { bcPlaying = false; return; }
+  bcPlaying = true;
+  const total = bcAudioQ.reduce((s, c) => s + c.length, 0);
+  const pcm = new Int16Array(total / 2); let off = 0;
+  while (bcAudioQ.length) { const c = bcAudioQ.shift(); pcm.set(new Int16Array(c.buffer, c.byteOffset, c.length / 2), off); off += c.length / 2; }
+  const buf = bcPlayCtx.createBuffer(1, pcm.length, 22050);
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+  const s = bcPlayCtx.createBufferSource();
+  bcCurSrc = s;
+  s.buffer = buf; s.connect(bcPlayCtx.destination);
+  s.onended = () => { bcPlaying = false; bcCurSrc = null; if (bcAudioQ.length) bcPlayNext(); };
+  s.start();
+}
+
+// ── LLM Model Switcher ──────────────────────────────────────────────
+async function loadLLM() {
+  const sel = $('llm-model');
+  const st = $('llm-status');
+  const btn = $('switch-llm-btn');
+  try {
+    const r = await (await fetch('/api/current-llm')).json();
+    sel.innerHTML = Object.keys(r.options).map(l =>
+      `<option value="${r.options[l]}" ${r.options[l]===r.model?'selected':''}>${l}</option>`
+    ).join('');
+    btn.disabled = false;
+    st.textContent = r.switching ? '🔄 Switching...' : r.model;
+    if (r.switching) setTimeout(loadLLM, 2000);
+  } catch (e) { st.textContent = 'Failed to load'; }
+}
+async function switchLLM() {
+  const sel = $('llm-model');
+  const st = $('llm-status');
+  const btn = $('switch-llm-btn');
+  btn.disabled = true;
+  st.textContent = '🔄 Switching model, vLLM restarting (~1 min)...';
+  try {
+    const r = await (await fetch('/api/switch-llm', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model: sel.value})
+    })).json();
+    if (r.error) { st.textContent = 'Error: ' + r.error; btn.disabled = false; return; }
+    setTimeout(loadLLM, 3000);
+  } catch (e) { st.textContent = 'Error: ' + e.message; btn.disabled = false; }
+}
+loadLLM();
+
+// ── Review Tab ──────────────────────────────────────────────────────
+function switchTab(name) {
+  const main = name === 'main';
+  $('view-main').classList.toggle('hidden', !main);
+  $('view-review').classList.toggle('hidden', main);
+  $('tab-main').className = 'px-4 py-2 rounded text-sm font-bold ' + (main ? 'bg-blue-600' : 'bg-gray-800');
+  $('tab-review').className = 'px-4 py-2 rounded text-sm font-bold ' + (main ? 'bg-gray-800' : 'bg-blue-600');
+  if (!main) fetchReviews();
+}
+
+function highlightDiff(realText, fullText) {
+  const realWords = (realText || '').split(/\\s+/).filter(Boolean);
+  const fullWords = (fullText || '').split(/\\s+/).filter(Boolean);
+  const fullSet = new Set(fullWords.map(w => w.toLowerCase()));
+  const realSet = new Set(realWords.map(w => w.toLowerCase()));
+  const missed = realWords.filter(w => !fullSet.has(w.toLowerCase()));
+  const extra = fullWords.filter(w => !realSet.has(w.toLowerCase()));
+
+  const highlight = (words, highlights, cls) =>
+    words.map(w => highlights.some(h => h.toLowerCase() === w.toLowerCase())
+      ? `<span class="${cls}">${w}</span>` : w).join(' ');
+
+  const hReal = highlight(realWords, missed, 'text-red-400 font-bold');
+  const hFull = highlight(fullWords, extra, 'text-green-400 font-bold');
+  return { hReal, hFull, missed: missed.length, extra: extra.length };
+}
+
+async function fetchReviews() {
+  try {
+    const calls = await (await fetch('/api/calls')).json();
+    const callable = calls.filter(c => c.callSid && (c.callSid.startsWith('browser_') || c.callSid.startsWith('CA')));
+    const list = $('review-list');
+    if (!callable.length) {
+      list.innerHTML = '<div class="text-gray-500 text-xs">No calls yet</div>';
+      return;
+    }
+    list.innerHTML = callable.slice(0, 10).map(c =>
+      `<div class="flex justify-between items-center bg-gray-900 rounded p-2 text-xs">
+        <span class="text-gray-400">${c.callSid.slice(0, 24)}…</span>
+        <span class="${c.status==='completed'?'text-green-400':'text-yellow-400'}">${c.status}</span>
+        <button onclick="openReview('${c.callSid}')"
+          class="px-2 py-0.5 bg-blue-700 hover:bg-blue-600 rounded text-[10px]">Review</button>
+      </div>`
+    ).join('');
+  } catch (e) {}
+}
+
+async function openReview(sid) {
+  const detail = $('review-detail');
+  const rTime = $('review-real-time');
+  const rFull = $('review-full-audio');
+  const rAI = $('review-ai-responses');
+  const rMeta = $('review-meta');
+  detail.classList.remove('hidden');
+  rTime.textContent = 'Loading...';
+  rFull.textContent = '';
+  rAI.textContent = '';
+  rMeta.textContent = '';
+  try {
+    const d = await (await fetch(`/api/calls/${sid}/review`)).json();
+    if (d.error) {
+      if (sid.startsWith('browser_')) {
+        rTime.textContent = '⏳ Offline transcription in progress — refresh in a few seconds.';
+        setTimeout(() => openReview(sid), 5000);
+      } else {
+        rTime.textContent = 'No transcript available for this call.';
+      }
+      return;
+    }
+
+    const userText = (d.real_time || []).join('\\n');
+    const fullText = d.full_audio || '';
+
+    const diff = highlightDiff(userText, fullText);
+    rTime.innerHTML = diff.hReal || '<span class="text-gray-500">(no speech detected)</span>';
+    rFull.innerHTML = diff.hFull || '<span class="text-gray-500">(no speech detected)</span>';
+    rAI.textContent = (d.ai_responses || []).join('\\n') || '(none)';
+
+    const dur = d.duration_sec ? Math.round(d.duration_sec / 60 * 10) / 10 + 'm' : '?';
+    const size = d.audio_size_bytes ? (d.audio_size_bytes / 1024 / 1024).toFixed(1) + 'MB' : '?';
+    const words = fullText ? fullText.split(/\\s+/).length : 0;
+    rMeta.textContent = `Duration: ${dur} · Audio: ${size} · Words: ${words} · ` +
+      `Missed: ${diff.missed} · Extra: ${diff.extra}`;
+  } catch (e) { rTime.textContent = 'Error loading review'; }
+}
+
+function closeReview() {
+  $('review-detail').classList.add('hidden');
+}
+
+fetchReviews();
+setInterval(fetchReviews, 5000);
+</script></body></html>"""
