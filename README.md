@@ -38,7 +38,7 @@ Insurance Co ←PSTN→ Twilio ←WSS μ-law→ Caddy (TLS) → voice-agent (Fas
 ## Files
 
 ```
-server.py        FastAPI app: /voice, /media, /make-call, /dashboard, Excel APIs
+server/          FastAPI app (package): /voice, /media, /make-call, /dashboard, Excel APIs
 call_session.py  Per-call pipeline (the Durable Object port)
 audio.py         μ-law codec, resampling, VAD
 prompts.py       System prompts + marker parsing (from do.ts)
@@ -72,6 +72,31 @@ open https://voice.yourcompany.com/dashboard
 ssh azureuser@$(pulumi stack output public_ip) \
   'cd /opt/ar-voice-agent/deploy && docker compose --profile dev logs -f voice-agent-dev'
 ```
+
+## Local Mac Development
+
+CPU/Apple-Silicon mirror — no CUDA/vLLM/Twilio. LLM via host Ollama, Chatterbox
+natively on MPS (Nano model), full Opik stack. See `ARCHITECTURE.md` → "Local Mac
+Development" for details.
+
+```bash
+# one-time: build the Chatterbox venv (torch arm64 + git-master chatterbox-tts)
+./chatterbox_service/setup-chatterbox-mac.sh
+# start everything (Ollama model check + native Chatterbox + Docker stack)
+./start-local.sh
+```
+
+| Service | URL |
+|---------|-----|
+| Admin UI | http://localhost:3000 |
+| Backend | http://localhost:8080 |
+| Opik | http://localhost:5173 |
+| Chatterbox (Nano/MPS) | http://127.0.0.1:8084 |
+
+> **Use Chatterbox NANO on the Mac, keep TURBO on the VM.** Turbo-fp32 on MPS is
+> 12.3 GB and throttles unpredictably (3–80 s per sentence); Nano is ~3 s and
+> ~7.8 GB. `run-mac.sh` defaults to `CHATTERBOX_NANO=1`. fp16 does not work on
+> MPS (library mixes fp32/fp16 in the s3gen decoder; Metal rejects it).
 
 ## Cost (10 concurrent calls, NC4as_T4_v3)
 

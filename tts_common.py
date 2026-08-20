@@ -222,9 +222,17 @@ def _slow_address(m):
 
 def _group_digits(m):
     """Read a long digit run slowly: individual digits in chunks of 4, with a
-    longer pause between chunks (claims/phone numbers)."""
+    longer pause between chunks (claims/phone numbers). A trailing chunk of
+    1-2 digits is merged into the previous chunk instead of being stranded on
+    its own: a lone tiny chunk is an isolated 1-2 character Chatterbox
+    generation, and those come back garbled (measured: single '8' was heard
+    as "Split?"/"Sir, Sable"). Allowing the final chunk to grow to 5-6 digits
+    keeps the whole run inside one clean, same-stream generation."""
     s = m.group(0)
     groups = [s[i:i + 4] for i in range(0, len(s), 4)]
+    if len(groups) > 1 and len(groups[-1]) <= 2:
+        tail = groups.pop()
+        groups[-1] += tail
     chars = []
     for i, g in enumerate(groups):
         if i:

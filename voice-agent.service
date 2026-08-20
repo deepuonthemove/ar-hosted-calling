@@ -1,14 +1,20 @@
 [Unit]
 Description=AR Voice Agent Server
-After=docker.service
-Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
 
+# NOTE: this VM (llama-si / call3.ar-voice.com) starts the stack via the
+# azureuser @reboot cron entry `start.sh`, not this unit. The main compose
+# services also use restart=unless-stopped so docker restores them at boot;
+# start.sh additionally brings up the Opik stack (restart: no) and re-joins
+# its frontend to the app network. This file is kept as a reference/alternative:
+#   sudo cp voice-agent.service /etc/systemd/system/ && sudo systemctl enable --now voice-agent
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=/opt/ar-voice-agent/deploy
-ExecStart=/usr/bin/docker compose up -d --build
-ExecStop=/usr/bin/docker compose down
+WorkingDirectory=/home/azureuser/ar-voice-agent
+ExecStart=/home/azureuser/ar-voice-agent/start.sh
+ExecStop=/usr/bin/docker compose --project-directory /home/azureuser/ar-voice-agent down
 Restart=on-failure
 RestartSec=10
 User=azureuser

@@ -1,12 +1,18 @@
 """Health, LLM switching, live/review/detail lookups, and app config API."""
 import asyncio
 import json
+import subprocess
+import tempfile
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import JSONResponse
 
-from .. import app_config
-from ..config import KOKORO_VOICE_OPTIONS, WHISPER_MODEL_SIZE, log
+from .. import app_config, chatterbox_voices
+from ..config import (
+    KOKORO_VOICE_OPTIONS, OPIK_BASE_URL, OPIK_ENABLED,
+    SPELL_PUNCT_OPTIONS, SPELL_SILENCE_OPTIONS, TTS_PAUSE_MODE_OPTIONS,
+    WHISPER_MODEL_SIZE, log,
+)
 from ..state import state
 
 router = APIRouter()
@@ -168,12 +174,23 @@ async def get_config():
         "stay_awake": cfg["stay_awake"] == "1",
         "kokoro_voice": cfg["kokoro_voice"],
         "spell_engine": cfg["spell_engine"],
-        "tts_options": ["piper", "kokoro"],
+        "spell_pause_mode": cfg["spell_pause_mode"],
+        "spell_silence_s": float(cfg["spell_silence_s"]),
+        "spell_punct": cfg["spell_punct"],
+        "chatterbox_voice": cfg["chatterbox_voice"],
+        "tts_options": ["piper", "kokoro", "chatterbox"],
         "vad_options": ["silero", "rms"],
         "kokoro_voice_options": KOKORO_VOICE_OPTIONS,
         "spell_engine_options": ["piper", "match"],
+        "spell_pause_mode_options": TTS_PAUSE_MODE_OPTIONS.get(
+            cfg["tts_engine"], ["processed", "silence", "punctuation"]),
+        "spell_silence_options": SPELL_SILENCE_OPTIONS,
+        "spell_punct_options": SPELL_PUNCT_OPTIONS,
+        "chatterbox_voice_options": chatterbox_voices.list_voices(),
         "llm_model": state["llm_model"],
         "llm_options": state["llm_options"],
+        "opik_enabled": OPIK_ENABLED,
+        "opik_url": OPIK_BASE_URL,
     }
 
 
@@ -181,10 +198,16 @@ async def get_config():
 async def post_config(request: Request):
     data = await request.json()
     updates = {}
+    cfg = await app_config.get_config()
     if "tts_engine" in data:
-        if data["tts_engine"] not in ("piper", "kokoro"):
-            return JSONResponse({"error": "tts_engine must be piper or kokoro"}, 400)
+        if data["tts_engine"] not in ("piper", "kokoro", "chatterbox"):
+            return JSONResponse({"error": "tts_engine must be piper, kokoro, or chatterbox"}, 400)
         updates["tts_engine"] = data["tts_engine"]
+        # "processed" pause mode is not valid for Chatterbox (see
+        # TTS_PAUSE_MODE_OPTIONS) — fall back to punctuation so switching to
+        # it never leaves a now-unsupported mode active.
+        if data["tts_engine"] == "chatterbox" and cfg.get("spell_pause_mode") == "processed":
+            updates["spell_pause_mode"] = "punctuation"
     if "vad_mode" in data:
         if data["vad_mode"] not in ("silero", "rms"):
             return JSONResponse({"error": "vad_mode must be silero or rms"}, 400)
@@ -199,6 +222,74 @@ async def post_config(request: Request):
         if data["spell_engine"] not in ("piper", "match"):
             return JSONResponse({"error": "spell_engine must be piper or match"}, 400)
         updates["spell_engine"] = data["spell_engine"]
+    if "spell_pause_mode" in data:
+        engine = updates.get("tts_engine", cfg.get("tts_engine"))
+        allowed = TTS_PAUSE_MODE_OPTIONS.get(engine, ["processed", "silence", "punctuation"])
+        if data["spell_pause_mode"] not in allowed:
+            return JSONResponse({"error": f"spell_pause_mode for {engine} must be one of {allowed}"}, 400)
+        updates["spell_pause_mode"] = data["spell_pause_mode"]
+    if "spell_silence_s" in data:
+        if data["spell_silence_s"] not in SPELL_SILENCE_OPTIONS:
+            return JSONResponse({"error": f"spell_silence_s must be one of {SPELL_SILENCE_OPTIONS}"}, 400)
+        updates["spell_silence_s"] = data["spell_silence_s"]
+    if "spell_punct" in data:
+        if data["spell_punct"] not in SPELL_PUNCT_OPTIONS:
+            return JSONResponse({"error": f"spell_punct must be one of {SPELL_PUNCT_OPTIONS}"}, 400)
+        updates["spell_punct"] = data["spell_punct"]
+    if "chatterbox_voice" in data:
+        voice = data["chatterbox_voice"] or ""
+        if voice and not chatterbox_voices.voice_exists(voice):
+            return JSONResponse({"error": f"unknown chatterbox_voice {voice!r}"}, 400)
+        updates["chatterbox_voice"] = voice
     if updates:
         await app_config.set_config(**updates)
     return {"ok": True, "config": await app_config.get_config()}
+
+
+# ── Chatterbox cloned-voice reference clips (record in Settings) ────────
+@router.get("/api/chatterbox/voices")
+async def list_chatterbox_voices():
+    return {"voices": chatterbox_voices.list_voices()}
+
+
+@router.post("/api/chatterbox/voices")
+async def upload_chatterbox_voice(request: Request, file: UploadFile = File(...)):
+    form = await request.form()
+    name = str(form.get("name", "")).strip()
+    if not name:
+        return JSONResponse({"error": "name is required"}, 400)
+    safe_name = chatterbox_voices.sanitize_voice_name(name)
+    if not safe_name:
+        return JSONResponse({"error": "name must contain at least one letter, digit, - or _"}, 400)
+
+    raw = await file.read()
+    if not raw:
+        return JSONResponse({"error": "empty upload"}, 400)
+
+    dest = chatterbox_voices.voice_path(safe_name)
+    # Browsers record via MediaRecorder as webm/opus (or similar), not WAV —
+    # ffmpeg converts whatever container/codec comes in to the mono 24kHz
+    # WAV Chatterbox expects as an audio_prompt_path reference.
+    with tempfile.NamedTemporaryFile(suffix=".input") as src:
+        src.write(raw)
+        src.flush()
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", src.name, "-ac", "1", "-ar", "24000", dest,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            log.warning("ffmpeg voice conversion failed for %r: %s", safe_name, stderr.decode(errors="replace")[-2000:])
+            return JSONResponse({"error": "could not decode uploaded audio"}, 400)
+
+    return {"ok": True, "name": safe_name, "voices": chatterbox_voices.list_voices()}
+
+
+@router.delete("/api/chatterbox/voices/{name}")
+async def delete_chatterbox_voice(name: str):
+    if not chatterbox_voices.delete_voice(name):
+        return JSONResponse({"error": "voice not found"}, 404)
+    cfg = await app_config.get_config()
+    if cfg["chatterbox_voice"] == name:
+        await app_config.set_config(chatterbox_voice="")
+    return {"ok": True, "voices": chatterbox_voices.list_voices()}

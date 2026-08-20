@@ -87,7 +87,10 @@ fi
 cd /opt/opik/deployment/docker-compose
 # Ensure the override remaps the backend to host port 8083, disables auth,
 # and joins the app network so Caddy + the SDK can reach the frontend.
-if [ -f docker-compose.override.yml ] && ! grep -q '8083' docker-compose.override.yml 2>/dev/null; then
+OVERRIDE=""
+[ -f docker-compose.override.yaml ] && OVERRIDE="-f docker-compose.override.yaml"
+[ -f docker-compose.override.yml ] && OVERRIDE="-f docker-compose.override.yml"
+if [ -n "$OVERRIDE" ] && ! grep -q '8083' $OVERRIDE 2>/dev/null; then
   sudo tee docker-compose.override.yml >/dev/null <<EOF
 services:
   backend:
@@ -111,7 +114,7 @@ networks:
     external: true
 EOF
 fi
-sudo docker compose -f docker-compose.yaml -f docker-compose.override.yml --profile opik up -d
+sudo docker compose -f docker-compose.yaml $OVERRIDE --profile opik up -d
 # Let the app's Caddy reach the Opik frontend (different docker network).
 sudo docker network connect ar-voice-agent_default opik-frontend-1 2>/dev/null || true
 # Point the app at the Opik FRONTEND via the docker gateway (host port 5173).

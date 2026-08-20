@@ -1,0 +1,236 @@
+# Local Mac (Apple Silicon) dev stack — no NVIDIA GPU, no Twilio, no vLLM.
+# LLM: host Ollama (llama3.1:8b via derived `ar-agent` model, 8192 ctx).
+# Usage:  docker compose -f docker-compose.local.yml up -d --build
+#         docker compose -f docker-compose.local.yml down
+#
+# Opik (tracing/eval) is a heavy 6-container stack (mysql/clickhouse/
+# zookeeper/backend/worker/frontend) and is the biggest contributor to a
+# slow local startup. It's opt-in here via the `opik` profile:
+#   docker compose -f docker-compose.local.yml --profile opik up -d --build
+# Without --profile opik, only redis + voice-agent + frontend start.
+services:
+  # ── One-shot: ensure Piper voice model exists in the shared volume ─────
+  piper-init:
+    image: alpine:3.20
+    command: >
+      sh -c 'for f in en_US-lessac-medium.onnx en_US-lessac-medium.onnx.json; do
+        if [ ! -s /models/piper/$$f ]; then
+          echo ">> Downloading piper $$f ..."
+          wget -q -O /models/piper/$$f https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/$$f;
+        fi; done'
+    volumes:
+      - piper-models:/models/piper
+
+  # ── Local Redis ───────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+
+  # ── Voice agent (CPU: whisper int8, piper/kokoro, Ollama LLM) ─────────
+  voice-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    container_name: voice-agent
+    restart: unless-stopped
+    environment:
+      - WHISPER_DEVICE=cpu
+      - WHISPER_COMPUTE=int8
+      - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE:-distil-large-v3}
+      - VLLM_BASE_URL=http://host.docker.internal:11434/v1
+      - LLM_MODEL=ar-agent
+      - REDIS_URL=redis://redis:6379
+      - KOKORO_DEVICE=cpu
+      - TTS_ENGINE=${TTS_ENGINE:-piper}
+      - PUBLIC_DOMAIN=localhost:8080
+      - PUBLIC_SCHEME=http
+      # Opt-in: Opik stack only exists when started with --profile opik.
+      - OPIK_ENABLED=${OPIK_ENABLED:-0}
+      - OPIK_BASE_URL=http://opik-frontend:5173
+      - CHATTERBOX_SERVICE_URL=http://host.docker.internal:8084
+      - CHATTERBOX_DEVICE=mps
+      # Punctuation mode folds a spelled-out claim ID into ONE synth call
+      # instead of one HTTP call per character — avoids the per-character
+      # SPELL_CHAR_TIMEOUT_S drop that shows up as audio cutting out mid-ID
+      # on Chatterbox/MPS (each isolated-character generation is slow enough
+      # to occasionally miss the timeout and get silently skipped).
+      - SPELL_PAUSE_MODE=${SPELL_PAUSE_MODE:-punctuation}
+    ports:
+      - "8080:8080"
+    depends_on:
+      - piper-init
+      - redis
+    volumes:
+      - ./:/app
+      - piper-models:/models/piper
+      - ${CHATTERBOX_VOICES_DIR:-$HOME/.cache/ar-voice-agent/chatterbox/voices}:/models/chatterbox/voices
+      - model-cache:/root/.cache
+
+  # ── Next.js admin UI ──────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE: http://localhost:8080
+        NEXT_PUBLIC_OPIK_HOST: http://localhost:5173
+    container_name: frontend
+    restart: unless-stopped
+    environment:
+      - NEXT_PUBLIC_API_BASE=http://localhost:8080
+      - NEXT_PUBLIC_OPIK_HOST=http://localhost:5173
+    ports:
+      - "3000:3000"
+    depends_on:
+      - voice-agent
+
+  # ── Opik (LLM tracing/eval) — full stack, mirrors the VM ─────────────
+  # UI: http://localhost:5173 · API: http://localhost:8082
+  opik-redis:
+    image: redis:7.2.4-alpine3.19
+    container_name: opik-redis
+    restart: unless-stopped
+    profiles: ["opik"]
+
+  opik-mysql:
+    image: mysql:8.4.2
+    container_name: opik-mysql
+    restart: unless-stopped
+    profiles: ["opik"]
+    environment:
+      MYSQL_ROOT_PASSWORD: opik
+      MYSQL_DATABASE: opik
+      MYSQL_USER: opik
+      MYSQL_PASSWORD: opik
+    volumes:
+      - opik-mysql:/var/lib/mysql
+    healthcheck:
+      test: [ "CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent" ]
+      timeout: 1s
+      interval: 1s
+      retries: 300
+
+  opik-clickhouse:
+    image: clickhouse/clickhouse-server:26.3.16.16-alpine
+    container_name: opik-clickhouse
+    restart: unless-stopped
+    profiles: ["opik"]
+    environment:
+      CLICKHOUSE_DB: opik
+      CLICKHOUSE_USER: opik
+      CLICKHOUSE_PASSWORD: opik
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - opik-clickhouse:/var/lib/clickhouse
+      - ./clickhouse_config/additional_config.xml:/etc/clickhouse-server/config.d/additional_config.xml:ro
+      - ./clickhouse_config/users.d/enable_time_type.xml:/etc/clickhouse-server/users.d/enable_time_type.xml:ro
+    ulimits:
+      nofile: 262144
+      nproc: 8192
+      memlock: -1
+    depends_on:
+      opik-zookeeper:
+        condition: service_healthy
+
+  opik-zookeeper:
+    image: zookeeper:3.9.4
+    container_name: opik-zookeeper
+    restart: unless-stopped
+    profiles: ["opik"]
+    user: root
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        mkdir -p /bitnami/zookeeper/data
+        chown -R zookeeper:zookeeper /bitnami/zookeeper
+        exec gosu zookeeper /docker-entrypoint.sh zkServer.sh start-foreground
+    environment:
+      JVMFLAGS: "-Xmx512m"
+      ZOO_4LW_COMMANDS_WHITELIST: "srvr,ruok"
+      ZOO_DATA_DIR: /bitnami/zookeeper/data
+      ZOO_DATA_LOG_DIR: /bitnami/zookeeper/data
+    healthcheck:
+      test: [ "CMD-SHELL", "echo ruok | nc localhost 2181 | grep -q imok" ]
+      interval: 1s
+      timeout: 1s
+      retries: 300
+    volumes:
+      - opik-zookeeper:/bitnami/zookeeper
+
+  opik-backend:
+    image: ghcr.io/comet-ml/opik/opik-backend:latest
+    container_name: opik-backend
+    restart: unless-stopped
+    profiles: ["opik"]
+    ports:
+      - "8082:8080"  # remapped (8080 is used by voice-agent)
+    command: [ "bash", "-c", "./run_db_migrations.sh && ./entrypoint.sh" ]
+    environment:
+      STATE_DB_PROTOCOL: "jdbc:mysql://"
+      STATE_DB_URL: "opik-mysql:3306/opik?createDatabaseIfNotExist=true&rewriteBatchedStatements=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true"
+      STATE_DB_DATABASE_NAME: opik
+      STATE_DB_USER: opik
+      STATE_DB_PASS: opik
+      ANALYTICS_DB_MIGRATIONS_URL: "jdbc:clickhouse://opik-clickhouse:8123"
+      ANALYTICS_DB_MIGRATIONS_USER: opik
+      ANALYTICS_DB_MIGRATIONS_PASS: opik
+      ANALYTICS_DB_PROTOCOL: "HTTP"
+      ANALYTICS_DB_HOST: "opik-clickhouse"
+      ANALYTICS_DB_PORT: 8123
+      ANALYTICS_DB_DATABASE_NAME: opik
+      ANALYTICS_DB_USERNAME: opik
+      ANALYTICS_DB_PASS: opik
+      REDIS_URL: redis://opik-redis:6379
+      TOGGLE_OPIK_AI_ENABLED: "true"
+      TOGGLE_AGENTS_ENABLED: "true"
+      AUTH_ENABLED: "false"
+    depends_on:
+      opik-mysql:
+        condition: service_healthy
+      opik-clickhouse:
+        condition: service_started
+      opik-redis:
+        condition: service_started
+
+  opik-worker:
+    image: ghcr.io/comet-ml/opik/opik-python-backend:latest
+    container_name: opik-worker
+    restart: unless-stopped
+    profiles: ["opik"]
+    environment:
+      REDIS_URL: redis://opik-redis:6379
+      CLICKHOUSE_URL: "http://opik:opik@opik-clickhouse:8123"
+      GRPC_SERVER_PORT: 8081
+    depends_on:
+      - opik-backend
+      - opik-clickhouse
+      - opik-redis
+
+  opik-frontend:
+    image: ghcr.io/comet-ml/opik/opik-frontend:latest
+    container_name: opik-frontend
+    restart: unless-stopped
+    profiles: ["opik"]
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./nginx_opik_local.conf:/etc/nginx/templates/default.conf.template:ro
+    environment:
+      NGINX_PORT: 5173
+      OPIK_UI_OTEL_EXPORTER_OTLP_ENDPOINT: "http://opik-backend:8080"
+      OPIK_UI_SERVICE_PORT: 5173
+    depends_on:
+      - opik-backend
+
+volumes:
+  redis-data:
+  piper-models:
+  model-cache:
+  opik-clickhouse:
+  opik-mysql:
+  opik-zookeeper:

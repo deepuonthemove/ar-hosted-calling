@@ -10,4 +10,6 @@ twilio>=9.4
 python-multipart>=0.0.20
 piper-tts>=1.2
 kokoro>=0.3.0
+silero-vad>=6.0
 opik==2.2.21
+transformers==4.46.3

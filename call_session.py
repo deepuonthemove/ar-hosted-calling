@@ -585,7 +585,9 @@ class CallSession:
             frame = bytearray()
             sent_samples = 0
             audio_started = False
-            async for pcm_chunk in self.tts_stream_fn(text, stop_event=stop_event):
+            sent_log: list = []
+            async for pcm_chunk in self.tts_stream_fn(text, stop_event=stop_event,
+                                                      sent_log=sent_log):
                 mulaw = piper_to_twilio(
                     np.frombuffer(pcm_chunk, dtype=np.int16), PIPER_RATE
                 )
@@ -601,16 +603,20 @@ class CallSession:
                         audio_started = True
                         self.tts_total_ms += (time.time() - tts_t0) * 1000
                         self.tts_count += 1
-                        _opik_span(self._current_trace, "twilio.tts", "general",
-                                   {"text": text[:120]},
-                                   {"audio_bytes": sent_samples * 2,
-                                    "latency_ms": round((time.time() - tts_t0) * 1000, 1)},
-                                   tts_t0, time.time())
                     await self.ws.send_text(json.dumps({
                         "event": "media",
                         "streamSid": self.stream_sid,
                         "media": {"payload": base64.b64encode(chunk).decode()},
                     }))
+            if audio_started and self._current_trace is not None:
+                # Single span AFTER streaming so `sent_log` holds every call
+                # actually made to the TTS engine (verbatim, punctuation and
+                # all) — not just the LLM's pre-transform text.
+                _opik_span(self._current_trace, "twilio.tts", "general",
+                           {"text": text[:2000], "sent": sent_log},
+                           {"audio_bytes": sent_samples * 2,
+                            "latency_ms": round((time.time() - tts_t0) * 1000, 1)},
+                           tts_t0, time.time())
             if frame:
                 await self.ws.send_text(json.dumps({
                     "event": "media",

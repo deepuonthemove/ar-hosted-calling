@@ -1,3 +1,8 @@
 # Next.js build output
-/frontend/.next/
-/frontend/node_modules/
+**/.next/
+**/node_modules/
+**/__pycache__/
+
+# Native Chatterbox (Mac) venv + scratch
+chatterbox-venv/
+*.log

@@ -7,10 +7,10 @@ from faster_whisper import WhisperModel
 from openai import AsyncOpenAI
 
 from .config import (
-    KOKORO_DEVICE, KOKORO_VOICE, KOKORO_SPEED, LLM_MODEL, LLM_MODEL_OPTIONS,
-    OPIK_API_KEY, OPIK_BASE_URL, OPIK_ENABLED, PIPER_DATA_DIR, PIPER_VOICE,
-    REDIS_URL, VLLM_BASE_URL, WHISPER_COMPUTE, WHISPER_DEVICE, WHISPER_MODEL_SIZE,
-    log,
+    CHATTERBOX_DEVICE, CHATTERBOX_VOICES_DIR, KOKORO_DEVICE, KOKORO_VOICE,
+    KOKORO_SPEED, LLM_MODEL, LLM_MODEL_OPTIONS, OPIK_API_KEY, OPIK_BASE_URL,
+    OPIK_ENABLED, PIPER_DATA_DIR, PIPER_VOICE, REDIS_URL, VLLM_BASE_URL,
+    WHISPER_COMPUTE, WHISPER_DEVICE, WHISPER_MODEL_SIZE, log,
 )
 
 state: dict = {}
@@ -98,6 +98,16 @@ def load_models():
     except Exception as e:
         log.warning("Kokoro not available, will fall back to Piper: %s", e)
         state["kokoro_pipeline"] = None
+
+    try:
+        import os
+        os.makedirs(CHATTERBOX_VOICES_DIR, exist_ok=True)
+    except Exception:
+        pass
+    # Chatterbox runs as a SEPARATE service (chatterbox-tts container) so its
+    # transformers 5.2.0 dependency doesn't break Kokoro (transformers 4.x) in
+    # this process. The app calls it over HTTP — no model is loaded here.
+    state["chatterbox_model"] = None
 
     # Opik LLM evaluation/tracing
     if OPIK_ENABLED:

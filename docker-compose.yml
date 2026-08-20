@@ -10,9 +10,20 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
     command:
       - --model=${LLM_MODEL:-Qwen/Qwen2.5-7B-Instruct-AWQ}
-      - --gpu-memory-utilization=0.55
+      # 0.40 of 16GB = 6.4GB: ~4.7GB weights + ~1.7GB KV, enough for one full
+      # 8k-token context (~1.1GB KV) + headroom. The T4 is shared with Whisper
+      # (~2.6GB) and Chatterbox fp16 (~3.4GB+ gen spike); 0.55 left <1GB spare
+      # and calls OOM'd during simultaneous ASR+TTS. max-num-seqs=2 matches
+      # real usage (voice agent is single-call) so vLLM doesn't over-reserve.
+      - --gpu-memory-utilization=0.40
       - --max-model-len=8192
-      - --max-num-seqs=12
+      - --max-num-seqs=2
+      # Cap the KV cache at ~2GiB (~16k tokens = 2 full 8k contexts) so
+      # vLLM's process-level GPU footprint drops from ~9.5GB to ~7.5GB,
+      # leaving Whisper + Chatterbox room on the shared 16GB T4. vLLM's
+      # default let the cache grow to 3.66GiB+ and the resulting total
+      # (15.5GB+) left whisper no memory and OOM'd mid-call.
+      - --kv-cache-memory=2147483648
       - --quantization=awq
       - --dtype=auto
       - --port=8001
@@ -60,6 +71,7 @@ services:
     volumes:
       - model-cache:/root/.cache
       - piper-models:/models/piper
+      - chatterbox-voices:/models/chatterbox/voices
       - ./:/app
       - /var/run/docker.sock:/var/run/docker.sock
       - /home/azureuser/ar-voice-agent:/project
@@ -95,8 +107,39 @@ services:
     volumes:
       - model-cache:/root/.cache
       - piper-models:/models/piper
+      - chatterbox-voices:/models/chatterbox/voices
       - /var/run/docker.sock:/var/run/docker.sock
       - /home/azureuser/ar-voice-agent:/project
+    profiles: [prod]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ── Chatterbox TTS (voice cloning) — ISOLATED service ───────────────
+  # Runs in its own container with its own transformers 5.2.0 env, because
+  # chatterbox-tts hard-pins transformers 5.2.0 which breaks Kokoro (needs
+  # transformers 4.x) in the main voice-agent process. The app calls it over
+  # HTTP. Voices are recorded in Settings and stored in the shared
+  # chatterbox-voices volume, which both containers mount.
+  chatterbox-tts:
+    build:
+      context: ./chatterbox_service
+      dockerfile: Dockerfile
+    container_name: chatterbox-tts
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CHATTERBOX_DEVICE=cuda
+      - CHATTERBOX_VOICES_DIR=/models/chatterbox/voices
+    ports:
+      - "8082:8082"
+    volumes:
+      - chatterbox-voices:/models/chatterbox/voices
     profiles: [prod]
     deploy:
       resources:
@@ -219,5 +262,6 @@ volumes:
   model-cache:
   redis-data:
   piper-models:
+  chatterbox-voices:
   caddy-data:
   opik-clickhouse:

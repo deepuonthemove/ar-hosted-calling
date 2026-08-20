@@ -203,16 +203,16 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             if segment is None:
                 continue
 
-            # The greeting is non-interruptible: let it play fully before
-            # acting on speech captured underneath it (protects the very
-            # first message from echo/noise cancelling it).
-            if tts_task is greeting_task:
-                try:
-                    await tts_task
-                except Exception:
-                    pass
-
-            await cancel_tts()
+            # The greeting is non-interruptible: let it fully stream before
+            # acting on the VAD segment captured underneath it (protects the
+            # very first message from echo/noise cancelling it). Do NOT cancel
+            # its playback: tts_task finishing only means the audio was sent
+            # to the browser, whose queue may still be playing it — a \x02
+            # here wipes that queue mid-word (audible static click and a
+            # cut-off tail). Keep processing the captured segment below
+            # instead of dropping it: a real first utterance must produce a
+            # transcript turn + Opik trace, while a pure greeting-echo segment
+            # simply transcribes to <3 chars and is filtered.
             barge_in = False
 
             _trace = opik_start_trace("browser.turn", session_id,
@@ -231,9 +231,24 @@ async def browser_voice_loop(ws: WebSocket, session_id: str):
             opik_span(_trace, "browser.stt", "general",
                       {"audio_sec": round(len(segment) / 16000, 2)}, {"text": text},
                       _stt_t0, time.time())
+
+            # Only interrupt the bot for a REAL utterance. Transcribing before
+            # cancelling means a <3-char noise/echo segment (cough, throat
+            # clear, keyboard click) no longer cuts a multi-sentence reply off
+            # mid-stream — previously the flush cancelled TTS up front and then
+            # dropped the segment anyway, so a reply like a two-part question
+            # would be reduced to its first sentence.
             if len(text) < 3:
                 opik_end_trace(_trace, output={"text": text, "status": "empty"})
                 continue
+            if tts_task is greeting_task:
+                try:
+                    await tts_task
+                except Exception:
+                    pass
+                tts_task = None
+            else:
+                await cancel_tts()
 
             if _is_end_of_call(text, conversation):
                 await cancel_tts()
@@ -373,21 +388,22 @@ async def _stream_tts_reply(ws: WebSocket, text: str, tts_fn=tts_stream, tts_tim
     t0 = time.time()
     first = True
     total_bytes = 0
+    sent_log: list = []
     try:
-        async for pcm_bytes in tts_fn(text, stop_event=stop_event):
+        async for pcm_bytes in tts_fn(text, stop_event=stop_event, sent_log=sent_log):
             if first and tts_times is not None:
                 tts_times.append((time.time() - t0) * 1000)
                 first = False
             total_bytes += len(pcm_bytes)
             await ws.send_bytes(b"\x01" + pcm_bytes)
-            if first is False and trace is not None:
-                opik_span(trace, "browser.tts", "general", {"text": text[:120]},
-                          {"audio_bytes": total_bytes, "latency_ms": round((time.time() - t0) * 1000, 1)},
-                          t0, time.time())
-                trace = None
         if trace is not None:
-            opik_span(trace, "browser.tts", "general", {"text": text[:120]},
-                      {"audio_bytes": total_bytes}, t0, time.time())
+            # Single span AFTER streaming so `sent_log` holds every call that
+            # was actually made to the TTS engine (verbatim, punctuation and
+            # all) — not just the LLM's pre-transform text.
+            opik_span(trace, "browser.tts", "general",
+                      {"text": text[:2000], "sent": sent_log},
+                      {"audio_bytes": total_bytes, "latency_ms": round((time.time() - t0) * 1000, 1)},
+                      t0, time.time())
     except asyncio.CancelledError:
         pass
     except Exception as e:

@@ -9,9 +9,11 @@ Full port of the Cloudflare Workers app (src/index.ts + src/do.ts):
 This module wires the FastAPI app together from the route modules in
 server/routes/ — it holds no route logic itself.
 """
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from .routes import accounts, browser_ws, chat, dashboard, misc, stats, telephony
 from .state import load_models, state
@@ -25,6 +27,17 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+# Local dev: the admin UI (http://localhost:3000) fetches the API cross-origin.
+# In prod Caddy routes everything under one origin, so CORS is a no-op there.
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins or ["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 for router_module in (telephony, stats, accounts, chat, misc, dashboard, browser_ws):
     app.include_router(router_module.router)

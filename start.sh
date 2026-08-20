@@ -12,8 +12,11 @@ docker compose --profile prod --profile tls up -d
 # profile is not the real stack). Start it too if present.
 if [ -d /opt/opik/deployment/docker-compose ]; then
   (cd /opt/opik/deployment/docker-compose \
-    && sudo docker compose -f docker-compose.yaml -f docker-compose.override.yml \
-         --profile opik up -d)
+    && FILES="-f docker-compose.yaml" \
+    && [ -f docker-compose.override.yaml ] && FILES="$FILES -f docker-compose.override.yaml" \
+    && [ -f docker-compose.override.yml ] && FILES="$FILES -f docker-compose.override.yml" \
+    && sudo docker compose $FILES --profile opik up -d) \
+    && sudo docker network connect ar-voice-agent_default opik-frontend-1 2>/dev/null || true
 fi
 
 sleep 8

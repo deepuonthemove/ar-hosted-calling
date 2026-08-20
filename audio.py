@@ -70,19 +70,18 @@ def piper_to_twilio(pcm_int16: np.ndarray, piper_rate: int) -> bytes:
 
 
 # ── VAD (Silero VAD with RMS Energy Fallback) ──────────────────────────
+# Uses the `silero-vad` pip package's ONNX build rather than torch.hub's JIT
+# model: torch.hub's hubconf pulls in torchaudio, which isn't installed here
+# (and PyPI's torchaudio hasn't kept pace with recent torch releases, so
+# pinning it risks a torch downgrade that could break Kokoro/Whisper). The
+# ONNX model needs only onnxruntime (already a piper-tts dependency) and
+# exposes the same call signature, so VADIterator usage below is unchanged.
+# Silence here silently degrades to RMS-energy barge-in, which the browser
+# WS loop explicitly documents as unreliable — it can't distinguish the
+# bot's own TTS echo from real speech, so replies after the greeting get
+# self-cancelled almost immediately. Keep this import working.
 _silero_model = None
 _silero_utils: dict = {}
-
-
-def _find_vad_iterator(utils) -> type | None:
-    """Silero returns utils as a dict (older) or tuple (newer). Find VADIterator class."""
-    if isinstance(utils, dict):
-        return utils.get("VADIterator")
-    if isinstance(utils, (tuple, list)):
-        for u in utils:
-            if isinstance(u, type) and u.__name__ == "VADIterator":
-                return u
-    return None
 
 
 def load_silero_vad():
@@ -90,16 +89,9 @@ def load_silero_vad():
     if _silero_model is not None:
         return _silero_model, _silero_utils
     try:
-        import torch
-        model, utils = torch.hub.load(
-            repo_or_dir='snakers4/silero-vad',
-            model='silero_vad',
-            force_reload=False,
-            trust_repo=True,
-            onnx=False
-        )
-        _silero_model = model
-        _silero_utils = {"VADIterator": _find_vad_iterator(utils)}
+        from silero_vad import VADIterator, load_silero_vad as _load_onnx_vad
+        _silero_model = _load_onnx_vad(onnx=True)
+        _silero_utils = {"VADIterator": VADIterator}
         return _silero_model, _silero_utils
     except Exception as e:
         print(f"[VAD] Silero VAD load failed ({e}); falling back to RMS energy VAD")

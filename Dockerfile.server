@@ -1,13 +1,18 @@
+# syntax=docker/dockerfile:1
 FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl docker.io \
+# BuildKit cache mounts: package downloads persist under the docker data-root,
+# so rebuilds (after code changes) only hit the network for NEW packages.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    build-essential curl docker.io ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install -r requirements.txt
 
 # Pre-download Piper voice model (baked into image)
 RUN python -m piper --help > /dev/null 2>&1; \
@@ -15,9 +20,12 @@ RUN python -m piper --help > /dev/null 2>&1; \
     echo "warmup" | python -m piper --model en_US-lessac-medium \
       --data-dir /models/piper --output-raw > /dev/null 2>&1 || true
 
-COPY server.py call_session.py audio.py prompts.py tts_common.py tts_piper.py tts_kokoro.py ./
+COPY server/ ./server/
+COPY call_session.py audio.py prompts.py tts_common.py tts_piper.py tts_kokoro.py tts_chatterbox.py ./
 COPY static/ ./static/
 COPY payers/ ./payers/
+
+RUN mkdir -p /models/chatterbox/voices
 
 EXPOSE 8080
 

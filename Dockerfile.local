@@ -1,9 +1,11 @@
+# Local Apple-Silicon build: no CUDA, CPU-only torch/whisper/kokoro.
+# The LLM runs on the host via Ollama (http://host.docker.internal:11434/v1).
 # syntax=docker/dockerfile:1
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+FROM python:3.11-slim
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl \
+    build-essential curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -12,11 +14,9 @@ COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     pip install -r requirements.txt
 
-RUN mkdir -p /models/piper
-COPY payers/ ./payers/
-
-# Dev: source is volume-mounted — hot reload via uvicorn --reload
+RUN mkdir -p /models/piper /models/chatterbox/voices
 
 EXPOSE 8080
 
+# Dev: source is volume-mounted, hot reload via uvicorn --reload
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080", "--reload", "--reload-dir", "/app"]

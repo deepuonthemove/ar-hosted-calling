@@ -42,7 +42,7 @@ PIPER_SPELL_NOISE_SCALE = float(PIPER_SPELL_NOISE_SCALE) if PIPER_SPELL_NOISE_SC
 PIPER_SPELL_NOISE_W_SCALE = os.getenv("PIPER_SPELL_NOISE_W_SCALE")
 PIPER_SPELL_NOISE_W_SCALE = float(PIPER_SPELL_NOISE_W_SCALE) if PIPER_SPELL_NOISE_W_SCALE else None
 
-TTS_ENGINE = os.getenv("TTS_ENGINE", "piper")
+TTS_ENGINE = os.getenv("TTS_ENGINE", "chatterbox")
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_bella")
 KOKORO_RATE = 24000
 # <1.0 = slower (speed), 1.0 = normal
@@ -74,10 +74,88 @@ KOKORO_VOICE_OPTIONS = [
     "am_michael", "am_adam",
 ]
 
+# Chatterbox (Resemble AI) — zero-shot voice cloning TTS engine. Selected via
+# TTS_ENGINE=chatterbox. Every character (narration AND spelling) is
+# synthesized by Chatterbox itself, in the cloned voice — unlike Kokoro,
+# there is no fallback to Piper for spelled-out runs, since the whole point
+# of cloning is a single consistent voice across an entire response.
+CHATTERBOX_DEVICE = os.getenv("CHATTERBOX_DEVICE", "cuda")
+# Generation knobs — see Chatterbox's README for what these trade off
+# (exaggeration: expressiveness/emotion intensity; cfg_weight: how closely
+# the output follows the reference voice vs. the text prompt).
+CHATTERBOX_EXAGGERATION = float(os.getenv("CHATTERBOX_EXAGGERATION", "0.5"))
+CHATTERBOX_CFG_WEIGHT = float(os.getenv("CHATTERBOX_CFG_WEIGHT", "0.5"))
+# Directory holding cloned-voice reference clips, recorded from the browser
+# in Settings and saved as WAV (see routes/misc.py's /api/chatterbox/voices).
+# Each file's basename (without extension) is the voice's selectable name.
+CHATTERBOX_VOICES_DIR = os.getenv("CHATTERBOX_VOICES_DIR", "/models/chatterbox/voices")
+# "" = Chatterbox's own built-in default voice (no cloning, no audio_prompt_path).
+CHATTERBOX_VOICE = os.getenv("CHATTERBOX_VOICE", "")
+# Chatterbox runs in its OWN container (chatterbox-tts service) with a separate
+# transformers env so its deps don't clash with the main app (Kokoro needs
+# transformers 4.x; chatterbox-tts pins 5.2.0). The main app calls it over HTTP.
+CHATTERBOX_SERVICE_URL = os.getenv("CHATTERBOX_SERVICE_URL", "http://chatterbox-tts:8082")
+
 # Real silence injected between spelled-out characters/groups, so pacing
 # doesn't depend on how each engine happens to interpret punctuation.
 SPELL_CHAR_GAP_MS = int(os.getenv("SPELL_CHAR_GAP_MS", "260"))
 SPELL_GROUP_GAP_MS = int(os.getenv("SPELL_GROUP_GAP_MS", "420"))
+
+# How the gap between spelled-out characters is produced:
+#  - "processed" (default for piper/kokoro): each character goes through the
+#    fade/RMS-match pipeline in _synth_char_bytes before a short fixed gap —
+#    this is the original approach and stays the default for those engines.
+#  - "silence": each character is spoken once, plainly (no fade, no RMS
+#    gain-matching, no timeout/lock dance beyond what synthesis itself
+#    needs), followed by a flat block of real silence — "B", <silence>, "U",
+#    <silence>, "N". Trades a bit of loudness consistency for zero risk of
+#    the fade/gain step introducing static, and a simpler, faster path.
+#  - "punctuation": no per-character synth calls at all. The whole spelled
+#    run is rebuilt as ONE text string — characters separated by a chosen
+#    punctuation mark — and synthesized through the exact same single-stream
+#    call used for normal narration. The pause comes from however the
+#    engine naturally paces that punctuation mark, not an injected silence
+#    array, so it can never carry over a splice/click artifact from
+#    isolated single-character rendering. Durations below are typical,
+#    approximate — not a guaranteed length, since it's the engine's own
+#    prosody:
+#      period "."  or semicolon ";"  ~= 0.4s
+#      colon  ":"                    ~= 0.3s
+#      comma  ","                    ~= 0.2s
+#      line break "\n"               ~= 0.4s
+#
+# Chatterbox is excluded from "processed": its autoregressive model drifts
+# on very short isolated renders (duplicates/drops a token), and its CLI
+# pacing handles punctuation better than the fade/volume pipeline, so only
+# "silence", "punctuation", and "plain" are offered per-engine
+# (TTS_PAUSE_MODE_OPTIONS).
+#
+# "plain" skips per-character synthesis entirely: the whole utterance is
+# preprocessed into ordinary spoken words (numbers -> digit names, hyphenated
+# spellings -> spaced words) and streamed as one continuous narration. It is
+# the natural voice-clone path for Chatterbox — see server/tts_plain.py.
+SPELL_PAUSE_MODE = os.getenv("SPELL_PAUSE_MODE", "punctuation")
+# Pause mode choices offered in the settings UI, scoped per TTS engine.
+TTS_PAUSE_MODE_OPTIONS = {
+    "chatterbox": ["silence", "punctuation", "plain"],
+    "kokoro": ["processed", "silence", "punctuation", "plain"],
+    "piper": ["processed", "silence", "punctuation", "plain"],
+}
+# Silence duration used between characters when SPELL_PAUSE_MODE=silence.
+SPELL_SILENCE_S = float(os.getenv("SPELL_SILENCE_S", "1.0"))
+SPELL_SILENCE_OPTIONS = [0.5, 0.8, 1.0]
+
+# Punctuation mark injected between spelled characters when
+# SPELL_PAUSE_MODE=punctuation.
+SPELL_PUNCT = os.getenv("SPELL_PUNCT", "period")  # period|semicolon|colon|comma|linebreak
+SPELL_PUNCT_CHARS = {
+    "period": ".",
+    "semicolon": ";",
+    "colon": ":",
+    "comma": ",",
+    "linebreak": "\n",
+}
+SPELL_PUNCT_OPTIONS = list(SPELL_PUNCT_CHARS.keys())
 
 VAD_MODE = os.getenv("VAD_MODE", "silero")  # "rms" or "silero"
 

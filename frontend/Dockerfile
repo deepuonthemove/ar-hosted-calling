@@ -1,7 +1,8 @@
+# syntax=docker/dockerfile:1
 FROM node:20-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm install
+RUN --mount=type=cache,target=/root/.npm,sharing=locked npm install
 
 FROM node:20-alpine AS builder
 WORKDIR /app
@@ -11,7 +12,8 @@ ARG NEXT_PUBLIC_API_BASE
 ARG NEXT_PUBLIC_OPIK_HOST
 ENV NEXT_PUBLIC_API_BASE=${NEXT_PUBLIC_API_BASE:-https://call.ar-voice.com}
 ENV NEXT_PUBLIC_OPIK_HOST=${NEXT_PUBLIC_OPIK_HOST:-https://optik.call.ar-voice.com}
-RUN npm run build
+# Persist the Next.js build cache so rebuilds reuse compiled assets.
+RUN --mount=type=cache,target=/app/.next/cache,sharing=locked npm run build
 
 FROM node:20-alpine AS runner
 WORKDIR /app

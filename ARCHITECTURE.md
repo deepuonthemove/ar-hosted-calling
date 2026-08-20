@@ -258,6 +258,9 @@ VAD accumulates float32 chunks, flushes on silence (>700ms) or max speech durati
 |--------|--------|-------------|---------|--------|
 | Piper | subprocess (`python -m piper --output-raw`) | 22050 Hz | Robotic | ~100MB (voice data on disk) |
 | Kokoro | in-process (`KPipeline` on CPU) | 24000 Hz → resampled to 22050 | Natural | ~82MB (model in memory) |
+| Chatterbox (Turbo/Nano) | isolated HTTP service (`/tts`) | 24000 Hz → resampled to 22050 | Natural (voice cloning) | Turbo 3.8GB / Nano 2.8GB (weights) |
+
+**Chatterbox runs as a separate process**, never inside voice-agent: it hard-pins a transformers stack that would break Kokoro. On the VM it's the CUDA container `chatterbox-tts`; on the Mac it's a native Python venv driving MPS (see "Local Mac Development"). The main app calls it over HTTP (`CHATTERBOX_SERVICE_URL`).
 
 ---
 
@@ -316,6 +319,9 @@ VAD accumulates float32 chunks, flushes on silence (>700ms) or max speech durati
 | `PIPER_VOICE` | `en_US-lessac-medium` | Piper voice |
 | `PIPER_SAMPLE_RATE` | `22050` | Piper output rate |
 | `KOKORO_VOICE` | `af_bella` | Kokoro voice |
+| `CHATTERBOX_SERVICE_URL` | `http://n-tts:8082` (VM) / `http://host.docker.internal:8084` (Mac) | Chatterbox HTTP endpoint |
+| `CHATTERBOX_DEVICE` | `cuda` (VM) / `mps` (Mac) | Chatterbox compute device |
+| `CHATTERBOX_MODEL_REPO` | `ResembleAI/chatterbox-turbo` | Chatterbox model |
 | `HF_TOKEN` | `""` | HuggingFace download auth |
 | `MAX_HOLD_SEC` | `1800` | Max hold timeout |
 
@@ -325,6 +331,63 @@ VAD accumulates float32 chunks, flushes on silence (>700ms) or max speech durati
 |----------|----------|
 | Qwen 2.5 7B | `Qwen/Qwen2.5-7B-Instruct-AWQ` |
 | Llama 3.1 8B | `hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4` |
+
+---
+
+## Local Mac Development
+
+The `docker-compose.local.yml` stack is a CPU/Apple-Silicon mirror of the VM:
+no CUDA, no vLLM, no Twilio. LLM comes from host Ollama (`ar-agent`, a
+`llama3.1:8b` derived model); Opik runs in full (localhost:5173); Chatterbox
+runs natively on MPS.
+
+**Prereqs:** Docker Desktop, Ollama with `llama3.1:8b`.
+
+```bash
+# one-time: build the Chatterbox venv (torch arm64 + git-master chatterbox-tts)
+./chatterbox_service/setup-chatterbox-mac.sh
+# start everything (Ollama model check + native Chatterbox + Docker stack)
+./start-local.sh
+```
+
+| Service | URL | Notes |
+|---------|-----|-------|
+| Admin UI | http://localhost:3000 | Next.js frontend |
+| Backend | http://localhost:8080 | `/health`, `/api/config`, WS `/ws/{sid}` |
+| Redis | redis://localhost:6379 | |
+| Opik | http://localhost:5173 | full stack incl. ClickHouse/MySQL/ZooKeeper |
+| Opik API | http://localhost:8082 | |
+| Chatterbox | http://127.0.0.1:8084 | native `chatterbox_service/app_mac.py` |
+
+### Chatterbox on the Mac: use NANO, not Turbo
+
+On MPS, the Turbo model in fp32 is 12.3 GB of Metal buffers and its generation
+time is unpredictable (3–80 s for the same sentence — thermal throttling), which
+starves the browser WS and kills calls mid-greeting. **Nano is the local choice:**
+
+| | Turbo (fp32, MPS) | Nano (MPS) |
+|---|---|---|
+| Full greeting w/ claim number | 13–75 s | ~3 s |
+| First audio (browser WS) | 45 s+ | ~2 s |
+| Physical footprint | 12.3 GB | ~7.8 GB |
+
+`run-mac.sh` defaults `CHATTERBOX_NANO=1`. fp16 does NOT work on MPS: the
+library's s3gen flow decoder mixes fp32 (`torch.zeros`) with fp16 weights and
+Metal rejects it (`mps.add` requires matching dtypes) — leave Turbo in fp32.
+
+**Keep Turbo on the VM.** The T4 handles fp32 fine and its quality is better
+than Nano; Nano exists only to make local dev usable. `chatterbox_service/app_mac.py`
+uses the `ChatterboxTurboTTS` class for both — `nano=True` loads the smaller
+`ResembleAI/chatterbox-nano` weights.
+
+### Resource footprint (why local can thrash)
+
+The full local stack is heavy for 18 GB Macs: voice-agent holds Whisper
+(~2.4 GB), Opik's ClickHouse ~1.9 GB, and the native Chatterbox ~7.8 GB of
+Metal buffers. Together with the Docker VM overhead this routinely exceeds
+18 GB → macOS compresses ~9 GB and swaps ~6 GB, which stalls MPS TTS.
+If local TTS feels slow: stop the idle Opik stack
+(`docker compose -f docker-compose.local.yml stop opik-*`) to reclaim ~2.6 GB.
 
 ---
 
@@ -374,7 +437,7 @@ Requires Docker socket mount and `docker.io` in the voice-agent container.
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `server.py` | ~1000 | FastAPI app, all routes, TTS streaming, dashboard HTML, browser voice |
+| `server/` | ~2900 | FastAPI app package: config, state, TTS streaming, routes/ (telephony, accounts, chat, stats, misc, dashboard, browser voice) |
 | `call_session.py` | 519 | Per-call state machine, Twilio protocol, STT/LLM/TTS orchestration |
 | `prompts.py` | 261 | Prompt builder, marker parser, CALL_RESULT validator + repair |
 | `audio.py` | 113 | μ-law codec, resampling, VAD |
