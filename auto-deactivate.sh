@@ -17,7 +17,8 @@ fi
 
 COUNT=$(docker logs voice-agent --since 1h 2>/dev/null   | grep -cE '"(GET|POST) /(voice|media/|make-call|call-result|ws/|health)"')
 
-SSH=$(who 2>/dev/null | wc -l)
+# 'who' doesn't see Azure SSH sessions — check established TCP on port 22 instead.
+SSH=$(ss -tn state established '( dport = :22 or sport = :22 )' 2>/dev/null | tail -n +2 | wc -l)
 
 # User toggle: "stay_awake" in Redis disables auto-deactivation while working
 STAY=$(docker exec redis redis-cli hget config:app stay_awake 2>/dev/null)
